@@ -1,0 +1,114 @@
+{
+  "kind": "topic",
+  "schema_version": 1,
+  "spec_ref": "docs/spec/Thoughts_Box_V0_Spec.md#4.2",
+  "id_rule": "concept_seed_ + sha256(NFC(canonical_name)).hex[:12]，由播种器计算，不写在本文件中",
+  "rules": {
+    "reuse_first": "模型优先复用已有主题；无法匹配时提出新主题建议，新主题须经用户确认才成为正式概念",
+    "no_auto_merge": "不因词义接近自动合并主题；别名与主题合并是两件事",
+    "granularity": "主题是规范化索引，用户具体说出的那句话是念头（ThoughtItem）"
+  },
+  "concepts": [
+    { "canonical_name": "工作与职场", "aliases": [
+      { "alias": "工作", "mode": "auto" },
+      { "alias": "职场", "mode": "auto" },
+      { "alias": "上班", "mode": "suggest" },
+      { "alias": "同事关系", "mode": "suggest" },
+      { "alias": "领导", "mode": "suggest" }
+    ] },
+    { "canonical_name": "家庭与家人", "aliases": [
+      { "alias": "家人", "mode": "auto" },
+      { "alias": "家里", "mode": "suggest" },
+      { "alias": "父母", "mode": "suggest" },
+      { "alias": "原生家庭", "mode": "suggest" }
+    ] },
+    { "canonical_name": "亲密关系与恋爱", "aliases": [
+      { "alias": "恋爱", "mode": "auto" },
+      { "alias": "伴侣", "mode": "auto" },
+      { "alias": "感情", "mode": "suggest" },
+      { "alias": "分手", "mode": "suggest" }
+    ] },
+    { "canonical_name": "朋友与社交", "aliases": [
+      { "alias": "朋友", "mode": "auto" },
+      { "alias": "社交", "mode": "auto" },
+      { "alias": "聚会", "mode": "suggest" }
+    ] },
+    { "canonical_name": "人际沟通与冲突", "aliases": [
+      { "alias": "吵架", "mode": "suggest" },
+      { "alias": "冲突", "mode": "suggest" },
+      { "alias": "沟通不畅", "mode": "suggest" },
+      { "alias": "冷战", "mode": "suggest" }
+    ] },
+    { "canonical_name": "自我评价与自信", "aliases": [
+      { "alias": "自信", "mode": "auto" },
+      { "alias": "自我怀疑", "mode": "suggest" },
+      { "alias": "自卑", "mode": "suggest" },
+      { "alias": "怕被评价", "mode": "suggest" }
+    ] },
+    { "canonical_name": "身份与价值观", "aliases": [
+      { "alias": "价值观", "mode": "auto" },
+      { "alias": "我是谁", "mode": "suggest" },
+      { "alias": "意义感", "mode": "suggest" }
+    ] },
+    { "canonical_name": "健康与身体", "aliases": [
+      { "alias": "身体", "mode": "auto" },
+      { "alias": "健康", "mode": "auto" },
+      { "alias": "生病", "mode": "suggest" },
+      { "alias": "锻炼", "mode": "suggest" }
+    ] },
+    { "canonical_name": "睡眠与休息", "aliases": [
+      { "alias": "睡觉", "mode": "auto" },
+      { "alias": "失眠", "mode": "suggest" },
+      { "alias": "熬夜", "mode": "suggest" },
+      { "alias": "休息", "mode": "suggest" }
+    ] },
+    { "canonical_name": "日常生活与习惯", "aliases": [
+      { "alias": "日常", "mode": "auto" },
+      { "alias": "习惯", "mode": "auto" },
+      { "alias": "拖延", "mode": "suggest" }
+    ] },
+    { "canonical_name": "学习与成长", "aliases": [
+      { "alias": "学习", "mode": "auto" },
+      { "alias": "成长", "mode": "auto" },
+      { "alias": "读书", "mode": "suggest" },
+      { "alias": "考试", "mode": "suggest" }
+    ] },
+    { "canonical_name": "金钱与财务", "aliases": [
+      { "alias": "钱", "mode": "auto" },
+      { "alias": "财务", "mode": "auto" },
+      { "alias": "消费", "mode": "suggest" },
+      { "alias": "花销", "mode": "suggest" }
+    ] },
+    { "canonical_name": "居住环境与空间", "aliases": [
+      { "alias": "住处", "mode": "suggest" },
+      { "alias": "搬家", "mode": "suggest" },
+      { "alias": "房间", "mode": "suggest" },
+      { "alias": "城市", "mode": "suggest" }
+    ] },
+    { "canonical_name": "兴趣与爱好", "aliases": [
+      { "alias": "爱好", "mode": "auto" },
+      { "alias": "兴趣", "mode": "auto" }
+    ] },
+    { "canonical_name": "游戏与娱乐", "aliases": [
+      { "alias": "游戏", "mode": "auto" },
+      { "alias": "娱乐", "mode": "auto" },
+      { "alias": "追剧", "mode": "suggest" }
+    ] },
+    { "canonical_name": "人生选择与变化", "aliases": [
+      { "alias": "辞职", "mode": "suggest" },
+      { "alias": "转折", "mode": "suggest" },
+      { "alias": "做决定", "mode": "suggest" }
+    ] },
+    { "canonical_name": "未来与不确定性", "aliases": [
+      { "alias": "未来", "mode": "auto" },
+      { "alias": "不确定性", "mode": "auto" },
+      { "alias": "规划", "mode": "suggest" },
+      { "alias": "担心以后", "mode": "suggest" }
+    ] },
+    { "canonical_name": "过去经历与回忆", "aliases": [
+      { "alias": "回忆", "mode": "auto" },
+      { "alias": "过去", "mode": "auto" },
+      { "alias": "小时候", "mode": "suggest" }
+    ] }
+  ]
+}

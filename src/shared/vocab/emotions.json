@@ -1,0 +1,172 @@
+{
+  "kind": "emotion",
+  "schema_version": 1,
+  "spec_ref": "docs/spec/Thoughts_Box_V0_Spec.md#4.1",
+  "id_rule": "concept_seed_ + sha256(NFC(canonical_name)).hex[:12]，由播种器计算，不写在本文件中",
+  "rules": {
+    "aliases": "只有 mode=auto 的别名参与自动归一化；mode 只能在此文件中设定，模型输出没有该权限",
+    "auto_scope": "V0 首批 auto 别名只收明确同义词，近义词一律 suggest",
+    "intensity": "情绪强度不在本文件与任何 LLM Schema 中，只由用户填写，未填写为空",
+    "closure": "本集合是受控种子，不宣称穷尽所有情绪；新概念须经用户确认"
+  },
+  "concepts": [
+    { "canonical_name": "开心", "aliases": [
+      { "alias": "高兴", "mode": "auto" },
+      { "alias": "快乐", "mode": "auto" },
+      { "alias": "愉快", "mode": "suggest" },
+      { "alias": "美", "mode": "suggest" }
+    ] },
+    { "canonical_name": "愉悦", "aliases": [
+      { "alias": "愉悦感", "mode": "auto" },
+      { "alias": "舒心", "mode": "suggest" }
+    ] },
+    { "canonical_name": "兴奋", "aliases": [
+      { "alias": "亢奋", "mode": "suggest" },
+      { "alias": "激动", "mode": "suggest" }
+    ] },
+    { "canonical_name": "满足", "aliases": [
+      { "alias": "知足", "mode": "suggest" },
+      { "alias": "够用了", "mode": "suggest" }
+    ] },
+    { "canonical_name": "安心", "aliases": [
+      { "alias": "踏实", "mode": "suggest" },
+      { "alias": "放心", "mode": "suggest" }
+    ] },
+    { "canonical_name": "放松", "aliases": [
+      { "alias": "松了", "mode": "suggest" },
+      { "alias": "舒缓", "mode": "suggest" }
+    ] },
+    { "canonical_name": "平静", "aliases": [
+      { "alias": "平和", "mode": "auto" },
+      { "alias": "宁静", "mode": "suggest" },
+      { "alias": "淡定", "mode": "suggest" }
+    ] },
+    { "canonical_name": "感激", "aliases": [
+      { "alias": "感恩", "mode": "auto" },
+      { "alias": "亏欠", "mode": "suggest" }
+    ] },
+    { "canonical_name": "感动", "aliases": [
+      { "alias": "触动", "mode": "suggest" },
+      { "alias": "破防", "mode": "suggest" }
+    ] },
+    { "canonical_name": "期待", "aliases": [
+      { "alias": "盼望", "mode": "suggest" },
+      { "alias": "想赶紧", "mode": "suggest" }
+    ] },
+    { "canonical_name": "好奇", "aliases": [
+      { "alias": "想知道为什么", "mode": "suggest" },
+      { "alias": "有兴趣", "mode": "suggest" }
+    ] },
+    { "canonical_name": "自豪", "aliases": [
+      { "alias": "骄傲", "mode": "suggest" },
+      { "alias": "与有荣焉", "mode": "suggest" }
+    ] },
+    { "canonical_name": "温暖", "aliases": [
+      { "alias": "暖心", "mode": "suggest" },
+      { "alias": "被接住", "mode": "suggest" }
+    ] },
+    { "canonical_name": "释然", "aliases": [
+      { "alias": "放下了", "mode": "suggest" },
+      { "alias": "想通了", "mode": "suggest" }
+    ] },
+    { "canonical_name": "悲伤", "aliases": [
+      { "alias": "难过", "mode": "auto" },
+      { "alias": "伤心", "mode": "auto" },
+      { "alias": "想哭", "mode": "suggest" },
+      { "alias": "低落", "mode": "suggest" }
+    ] },
+    { "canonical_name": "失落", "aliases": [
+      { "alias": "落差", "mode": "suggest" },
+      { "alias": "空落落", "mode": "suggest" }
+    ] },
+    { "canonical_name": "孤独", "aliases": [
+      { "alias": "孤单", "mode": "auto" },
+      { "alias": "寂寞", "mode": "suggest" },
+      { "alias": "没人懂", "mode": "suggest" }
+    ] },
+    { "canonical_name": "焦虑", "aliases": [
+      { "alias": "焦灼", "mode": "suggest" },
+      { "alias": "不安", "mode": "suggest" },
+      { "alias": "慌", "mode": "suggest" }
+    ] },
+    { "canonical_name": "担忧", "aliases": [
+      { "alias": "担心", "mode": "auto" },
+      { "alias": "悬着", "mode": "suggest" }
+    ] },
+    { "canonical_name": "恐惧", "aliases": [
+      { "alias": "害怕", "mode": "auto" },
+      { "alias": "怕", "mode": "auto" },
+      { "alias": "发怵", "mode": "suggest" }
+    ] },
+    { "canonical_name": "紧张", "aliases": [
+      { "alias": "紧绷", "mode": "suggest" },
+      { "alias": "手心出汗", "mode": "suggest" }
+    ] },
+    { "canonical_name": "烦躁", "aliases": [
+      { "alias": "烦", "mode": "auto" },
+      { "alias": "躁", "mode": "suggest" },
+      { "alias": "被打扰", "mode": "suggest" }
+    ] },
+    { "canonical_name": "愤怒", "aliases": [
+      { "alias": "生气", "mode": "auto" },
+      { "alias": "恼火", "mode": "suggest" },
+      { "alias": "火大", "mode": "suggest" }
+    ] },
+    { "canonical_name": "委屈", "aliases": [
+      { "alias": "憋屈", "mode": "suggest" },
+      { "alias": "被误解", "mode": "suggest" }
+    ] },
+    { "canonical_name": "尴尬", "aliases": [
+      { "alias": "难堪", "mode": "suggest" },
+      { "alias": "下不来台", "mode": "suggest" },
+      { "alias": "社死", "mode": "suggest" }
+    ] },
+    { "canonical_name": "羞耻", "aliases": [
+      { "alias": "羞惭", "mode": "auto" },
+      { "alias": "丢人", "mode": "suggest" }
+    ] },
+    { "canonical_name": "内疚", "aliases": [
+      { "alias": "愧疚", "mode": "auto" },
+      { "alias": "自责", "mode": "suggest" },
+      { "alias": "对不起", "mode": "suggest" }
+    ] },
+    { "canonical_name": "后悔", "aliases": [
+      { "alias": "懊悔", "mode": "auto" },
+      { "alias": "早知道", "mode": "suggest" }
+    ] },
+    { "canonical_name": "失望", "aliases": [
+      { "alias": "心凉", "mode": "suggest" },
+      { "alias": "不抱希望", "mode": "suggest" }
+    ] },
+    { "canonical_name": "嫉妒", "aliases": [
+      { "alias": "妒忌", "mode": "auto" },
+      { "alias": "酸", "mode": "suggest" }
+    ] },
+    { "canonical_name": "羡慕", "aliases": [
+      { "alias": "向往", "mode": "suggest" },
+      { "alias": "想要同款", "mode": "suggest" }
+    ] },
+    { "canonical_name": "厌恶", "aliases": [
+      { "alias": "恶心", "mode": "suggest" },
+      { "alias": "受不了", "mode": "suggest" }
+    ] },
+    { "canonical_name": "厌倦", "aliases": [
+      { "alias": "腻了", "mode": "suggest" },
+      { "alias": "无聊", "mode": "suggest" }
+    ] },
+    { "canonical_name": "无助", "aliases": [
+      { "alias": "无力", "mode": "suggest" },
+      { "alias": "没人帮", "mode": "suggest" }
+    ] },
+    { "canonical_name": "困惑", "aliases": [
+      { "alias": "疑惑", "mode": "auto" },
+      { "alias": "迷茫", "mode": "suggest" },
+      { "alias": "想不通", "mode": "suggest" }
+    ] },
+    { "canonical_name": "想念", "aliases": [
+      { "alias": "思念", "mode": "auto" },
+      { "alias": "怀念", "mode": "suggest" },
+      { "alias": "想见", "mode": "suggest" }
+    ] }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8737
+  },
+  "processing": {
+    "default_mode": "manual_only"
+  },
+  "model": {
+    "enabled": false,
+    "provider": "openai_compatible",
+    "base_url": "https://REPLACE_WITH_YOUR_OWN_PROVIDER_BASE_URL/v1",
+    "api_key_env": "TB_MODEL_API_KEY",
+    "cloud_redacted_enabled": false,
+    "request_timeout_ms": 30000
+  }
+}

@@ -1,0 +1,35 @@
+# 依赖与构建产物
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.npm-cache/
+
+# 密钥与运行时配置（永不入库）
+.env
+.env.*
+!.env.example
+config.local.json
+*_local.json
+
+# 运行时数据（TB_DATA_DIR 指到仓库内时的兜底）
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+runtime.lock
+runtime.lock.stale-*
+backups/
+debug-export/
+logs/
+*.log
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+
+# 本地临时目录
+scratch/
+/tmp/
+.qoder/

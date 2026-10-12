@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "spec_ref": "docs/spec/Thoughts_Box_V0_Spec.md#3.3, #3.7, #5.2",
+  "note": "本文件是封闭枚举的单一事实源。新增取值必须同时修改规格、Schema、迁移与测试；LLM 不得发明取值。",
+
+  "relation_types": [
+    { "type": "has_emotion", "carrier": "derived_from_mention", "source": "Episode", "target": "Concept:emotion", "directed": true, "creators": ["ai_generated", "user"] },
+    { "type": "on_topic", "carrier": "derived_from_mention", "source": "Episode", "target": "Concept:topic", "directed": true, "creators": ["ai_generated", "user"] },
+    { "type": "about", "carrier": "derived_from_mention", "source": "Episode", "target": "Entity:active", "directed": true, "creators": ["ai_generated", "user"] },
+    { "type": "possibly_related", "carrier": "GraphEdge", "source": "Episode", "target": "Episode", "directed": false, "creators": ["suggestion_then_user"] },
+    { "type": "same_as", "carrier": "GraphEdge", "source": "Entity", "target": "Entity", "directed": false, "creators": ["user"] },
+    { "type": "merged_into", "carrier": "GraphEdge", "source": "Concept", "target": "Concept", "directed": true, "creators": ["user"] },
+    { "type": "triggered_by", "carrier": "TriggerAssertion", "source": "EmotionMention", "target": "Episode", "directed": true, "creators": ["user"] },
+    { "type": "possibly_same_as", "carrier": "Suggestion", "source": "Entity", "target": "Entity", "directed": false, "creators": ["ai_suggestion"] }
+  ],
+  "relation_type_rules": {
+    "alias_of": "不是 GraphEdge；概念与实体别名分别由 ConceptAlias / EntityAlias 管理",
+    "not_stored_in_graph_edge": ["has_emotion", "on_topic", "about", "possibly_same_as", "triggered_by"],
+    "ai_may_never_create": ["triggered_by", "same_as", "merged_into"],
+    "graph_edge_endpoints_must_be": ["Episode", "Concept", "Entity:active"]
+  },
+
+  "entity_types": ["person", "organization", "place", "work", "product", "game", "other"],
+  "entity_type_rules": {
+    "closed": true,
+    "extension_path": "修改本文件 + 迁移 + 测试，不由 LLM 新增",
+    "mention_role": "EntityMention.role 是普通文本属性（如 colleague、friend、location），V0 不约束枚举、不参与关系类型、不生成边"
+  },
+
+  "mention_source_kinds": ["record_revision", "episode", "thought_item"],
+  "mention_source_rule": "每条 Mention 恰好指向一种来源；数据库 CHECK 约束拒绝零个或同时多个",
+
+  "origin_types": ["system_seed", "ai_generated", "user_created", "user_confirmed_suggestion"],
+  "origin_type_subsets": {
+    "note": "I2 裁决：ai_extraction 作废，统一为 ai_generated；system_seed 仅 Concept 播种使用。各表只允许下列适用子集。",
+    "concept": ["system_seed", "user_created", "user_confirmed_suggestion"],
+    "episode_thought_item_entity": ["ai_generated", "user_created"],
+    "mention": ["ai_generated", "user_created", "user_confirmed_suggestion"]
+  },
+  "basis_values": ["explicit", "inferred"],
+  "basis_origin_matrix": {
+    "legal": "explicit 可配 ai_generated / user_created / user_confirmed_suggestion；inferred 只可配 user_confirmed_suggestion",
+    "illegal": ["basis=inferred + origin_type=ai_generated", "basis=inferred + origin_type=user_created"]
+  },
+
+  "lifecycle_states": {
+    "Entity.lifecycle_status": {
+      "values": ["provisional", "active", "archived"],
+      "transitions": {
+        "provisional": ["active", "archived"],
+        "active": ["archived"],
+        "archived": ["active"]
+      },
+      "notes": "provisional→active 是实体提升（状态变化，不新建 ID）；archived 不是删除；active→provisional 已按 I1 裁决移除（无产品语义支撑）"
+    },
+    "Concept.lifecycle_status": {
+      "values": ["active", "merged", "archived"],
+      "transitions": {
+        "active": ["merged", "archived"],
+        "merged": ["active"],
+        "archived": ["active"]
+      },
+      "notes": "merged 由 merged_into 关系与合并记录支撑，撤销时原归属可完整恢复（ADR-010）"
+    },
+    "Episode.lifecycle_status": {
+      "values": ["active", "superseded"],
+      "transitions": { "active": ["superseded"], "superseded": [] },
+      "notes": "superseded 由候选采纳产生（B3）；voided 已按 U-4 裁决移除——B1 裁决后派生对象随来源硬删除，该状态无可达写入路径。superseded 是终态：旧派生内容不重新生效，改由新 run 产生新版本"
+    },
+    "ThoughtItem.lifecycle_status": {
+      "values": ["active", "superseded"],
+      "transitions": { "active": ["superseded"], "superseded": [] }
+    },
+    "Mention.status": {
+      "values": ["active", "superseded", "rejected"],
+      "transitions": {
+        "active": ["superseded", "rejected"],
+        "rejected": [],
+        "superseded": []
+      },
+      "notes": "rejected = 用户移除；重跑可产生新候选，但不得静默恢复同一被移除对象（按稳定 ID 判定）"
+    },
+    "GraphEdge.lifecycle_status": {
+      "values": ["active", "superseded"],
+      "transitions": { "active": ["superseded"], "superseded": [] },
+      "notes": "不与 Mention.status、Suggestion.status 合并含义"
+    },
+    "Suggestion.status": {
+      "values": ["pending", "accepted", "ignored", "withdrawn"],
+      "transitions": {
+        "pending": ["accepted", "ignored", "withdrawn"],
+        "ignored": ["pending", "withdrawn"],
+        "accepted": [],
+        "withdrawn": []
+      },
+      "notes": "ignored 由用户否决且不重复提出，可在\"已忽略\"筛选中找回并重新提出；withdrawn 因依据消失（reason_code=basis_lost，代码非原文）而失效，保留审计状态；B6 裁决新增 ignored→withdrawn"
+    },
+    "ParseRun.execution_status": {
+      "values": ["queued", "running", "succeeded", "failed"],
+      "transitions": {
+        "queued": ["running"],
+        "running": ["succeeded", "failed"],
+        "succeeded": [],
+        "failed": ["queued"]
+      },
+      "notes": "B3 裁决：执行状态与结果采纳状态分离（原 ParseRun.status 单键作废）；failed→queued 重试复用同一 idempotency_key 行；succeeded/failed 后执行态不再变"
+    },
+    "ParseRun.result_state": {
+      "values": ["candidate", "current", "superseded"],
+      "transitions": {
+        "candidate": ["current", "superseded"],
+        "current": ["superseded"],
+        "superseded": []
+      },
+      "notes": "同一 Revision 同时至多一个 current（部分唯一索引 ux_run_current）；candidate 不进入当前视图与图谱；组合不变式 queued/running⇒candidate、current⇒succeeded 见 Schema 审查稿 §4.7"
+    }
+  },
+
+  "processing_modes": ["manual_only", "local_model", "cloud_redacted"],
+  "processing_statuses": [
+    "captured",
+    "awaiting_privacy_review",
+    "preprocessing",
+    "processing",
+    "parsed",
+    "failed",
+    "needs_reparse",
+    "not_processed"
+  ],
+  "processing_rules": {
+    "independent": "processing_status 与 processing_mode 与 CloudSendGrant 三者独立，不得互相推断",
+    "manual_only_not_pending": "manual_only 的记录不计入待整理",
+    "grant_is_per_content": "cloud_redacted 需要逐版本的本次发送授权；内容或脱敏策略变化后旧授权失效"
+  },
+
+  "suggestion_kinds": ["emotion_candidate", "alias", "new_concept", "possibly_related", "possibly_same_as", "evidence_repair"],
+
+  "event_time_precision": ["year", "month", "day", "unknown"],
+  "event_time_certainty": ["explicit", "approximate", "unknown"],
+  "event_time_rules": {
+    "compatibility": "I4/B8：unknown ⇒ 起止日期皆空且 certainty=unknown；year/month/day ⇒ 起止齐全、精确覆盖完整年度/自然月/单日、start<=end、raw 非空、certainty∈{explicit,approximate}；由数据库 CHECK 强制（Schema 审查稿 §3.8 P14 实测）"
+  },
+
+  "processing_status_transitions": {
+    "values": ["captured", "awaiting_privacy_review", "preprocessing", "processing", "parsed", "failed", "needs_reparse", "not_processed"],
+    "transitions": {
+      "captured": ["preprocessing", "awaiting_privacy_review", "not_processed"],
+      "awaiting_privacy_review": ["preprocessing", "not_processed"],
+      "preprocessing": ["processing", "failed"],
+      "processing": ["parsed", "failed"],
+      "parsed": ["needs_reparse"],
+      "failed": ["preprocessing"],
+      "needs_reparse": ["preprocessing"],
+      "not_processed": ["preprocessing"]
+    },
+    "notes": "I3 裁决（§4.8）：编辑产生新 revision ⇒ parsed→needs_reparse；manual_only 停留 captured；awaiting_privacy_review 仅 cloud 路径可达；privacy_level 不参与本状态机"
+  },
+
+  "privacy_levels": ["normal", "sensitive"],
+  "sleep_session_states": ["open", "closed"],
+  "closed_set_rule": "以上所有集合都是封闭枚举；实现中不得用字符串列 + 自由取值绕过 CHECK"
+}
