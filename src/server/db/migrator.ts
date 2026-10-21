@@ -144,3 +144,9 @@ export function getMeta(db: Database, key: string): string | undefined {
     | undefined;
   return row?.value;
 }
+
+/** 删除一个 app_meta 键（不存在即空操作）。用于记录硬删除时清掉其预览缓存残行（K-09 不留痕）。 */
+export function deleteMeta(db: Database, key: string): void {
+  if (!tableExists(db, "app_meta")) return;
+  db.prepare("delete from app_meta where key = ?").run(key);
+}

@@ -1,6 +1,6 @@
 {
   "name": "thoughts-box",
-  "version": "0.0.0",
+  "version": "0.5.0",
   "description": "思绪盒子 Thoughts Box — 本地优先的个人思绪整理工具（V0）",
   "type": "module",
   "engines": {
@@ -8,15 +8,17 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "launch": "node scripts/launch.mjs",
     "start:server": "node src/server/index.ts",
     "start:web": "vite",
+    "start:mock": "node scripts/mock-web.mjs",
     "build": "vite build && tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/web/tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "publish:oss": "node scripts/publish-oss.mjs"
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "lucide-react": "^1.59.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "zod": "^4.0.5"

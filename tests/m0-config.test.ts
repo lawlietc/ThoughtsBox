@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
   loadConfigFromPath,
   parseAppConfig,
   TEMPLATE_CONFIG_PATH,
+  writeConfigFile,
 } from "../src/server/config/config.ts";
 import { ConfigError } from "../src/server/config/errors.ts";
 import { resolveDataLayout } from "../src/server/config/paths.ts";
@@ -31,6 +32,45 @@ function sandboxDataDir(): string {
 function layoutWith(dataDir: string) {
   mkdirSync(dataDir, { recursive: true });
   return resolveDataLayout({ TB_DATA_DIR: dataDir });
+}
+
+function dualProfileRaw(): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    server: { host: "127.0.0.1", port: 8737 },
+    processing: { default_mode: "manual_only" },
+    model: {
+      enabled: true,
+      provider: "ollama",
+      base_url: "http://127.0.0.1:11434/v1",
+      api_key_env: "TB_LOCAL_MODEL_KEY",
+      cloud_redacted_enabled: false,
+      request_timeout_ms: 60000,
+      model: "qwen3:8b",
+      call_path: "ollama_openai_compatible",
+      supports_structured_output: false,
+      local_model: {
+        enabled: true,
+        provider: "ollama",
+        base_url: "http://127.0.0.1:11434/v1",
+        api_key_env: "TB_LOCAL_MODEL_KEY",
+        request_timeout_ms: 60000,
+        model: "qwen3:8b",
+        call_path: "ollama_openai_compatible",
+        supports_structured_output: false,
+      },
+      cloud_model: {
+        enabled: false,
+        provider: "openai_compatible",
+        base_url: "https://example.invalid/v1",
+        api_key_env: "TB_CLOUD_MODEL_KEY",
+        request_timeout_ms: 45000,
+        model: "gpt-4.1-mini",
+        call_path: "http_json_lenient",
+        supports_structured_output: true,
+      },
+    },
+  };
 }
 
 describe("配置加载（M0 交付物 5）", () => {
@@ -135,6 +175,46 @@ describe("配置加载（M0 交付物 5）", () => {
     expect(() => loadConfig(layout, {})).toThrow(/TB_MODEL_API_KEY/);
     const withKey = loadConfigFromPath(layout.configFile, { TB_MODEL_API_KEY: "secret" });
     expect(withKey.apiKey).toBe("secret");
+  });
+
+  it("双 profile 配置可解析；只启用本地档时不要求云端密钥", () => {
+    const layout = layoutWith(sandboxDataDir());
+    ensureConfigFile(layout);
+    writeFileSync(layout.configFile, JSON.stringify(dualProfileRaw()), "utf8");
+    const loaded = loadConfigFromPath(layout.configFile, {});
+    expect(loaded.config.model.local_model?.enabled).toBe(true);
+    expect(loaded.config.model.cloud_model?.enabled).toBe(false);
+    expect(loaded.apiKey).toBeUndefined();
+  });
+
+  it("本地 profile 启用时必须是回环地址", () => {
+    const raw = dualProfileRaw();
+    const model = raw.model as Record<string, unknown>;
+    const local = model.local_model as Record<string, unknown>;
+    local.base_url = "https://not-local.example/v1";
+    expect(() => parseAppConfig(raw, "inline")).toThrow(/本地模型只允许回环地址/);
+  });
+
+  it("云端 profile 启用但顶层隐私闸门关闭：矛盾配置直接拒绝", () => {
+    const raw = dualProfileRaw();
+    const model = raw.model as Record<string, unknown>;
+    const cloud = model.cloud_model as Record<string, unknown>;
+    cloud.enabled = true;
+    model.cloud_redacted_enabled = false;
+    expect(() => parseAppConfig(raw, "inline")).toThrow(/cloud_redacted_enabled 未开启/);
+  });
+
+  it("writeConfigFile 原子写回：落盘可重读且不遗留临时文件", () => {
+    const layout = layoutWith(sandboxDataDir());
+    ensureConfigFile(layout);
+    const config = parseAppConfig(dualProfileRaw(), layout.configFile);
+    writeConfigFile(layout.configFile, config);
+
+    const saved = JSON.parse(readFileSync(layout.configFile, "utf8")) as {
+      model: { local_model?: { model?: string } };
+    };
+    expect(saved.model.local_model?.model).toBe("qwen3:8b");
+    expect(readdirSync(layout.dataDir).some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
   it("拿锁之前不写配置：configSourcePath 只读定位来源", () => {

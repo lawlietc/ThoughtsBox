@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { VocabFile } from "../../shared/contracts/vocab.ts";
-import { seedConceptId } from "../../shared/contracts/ids.ts";
+import { seedConceptId, seedAliasId } from "../../shared/contracts/ids.ts";
 import { loadContracts, type Contracts } from "../../shared/contracts/load.ts";
 import type { Database } from "./adapter.ts";
 import { setMeta } from "./migrator.ts";
@@ -64,12 +64,122 @@ export interface SeedSummary {
   readonly autoAliases: number;
   readonly suggestAliases: number;
   readonly fingerprint: string;
+  /** M2：水位之外的真实 Concept/ConceptAlias 回填计数。 */
+  readonly tables: ConceptTableSummary;
+}
+
+export interface ConceptTableSummary {
+  readonly conceptsInserted: number;
+  readonly conceptsExisting: number;
+  readonly aliasesInserted: number;
+  readonly aliasesExisting: number;
+  /** 标准名/别名已被非种子行占据：播种器让位于既有数据，只登记不覆盖。 */
+  readonly skippedForUserRows: number;
 }
 
 /**
- * 词表播种水位写入（M0 交付物 4）。Concept 表本身属于 Schema 审查之后的里程碑，
- * 这里先保证「词表声明了什么」在数据层可查、可重放、可检测变化。
+ * 把词表落到真正的 Concept / ConceptAlias 表（Spec §9.3、K-14、K-15）。
+ *
+ * 三条守门规则：
+ * - 冲突目标写 `(concept_type, canonical_name)` 与 `(domain, alias)` 这两个业务唯一键，
+ *   并用 `where origin_type='system_seed'` / `where source='seed'` 限定：已被用户行占据的名字
+ *   直接跳过（DO UPDATE 的 WHERE 为假时既不更新也不报错），种子永不夺走用户已认领的概念。
+ * - 别名的 concept_id 取自回填后**实际存在**的那一行，而不是词表推导的种子 ID——
+ *   标准名若由用户先建，别名必须挂到用户行上，否则指向不存在的对象。
+ * - mode 逐字来自词表文件：`auto` 只有这里能写进去（K-14），服务层与 T-22 共同守门。
  */
+function backfillConceptTables(
+  db: Database,
+  entries: readonly SeedEntry[],
+  now: string,
+): ConceptTableSummary {
+  const selectConcept = db.prepare(
+    "select id, origin_type from concept where concept_type = ? and canonical_name = ?",
+  );
+  const upsertConcept = db.prepare(
+    `insert into concept (id, concept_type, canonical_name, origin_type, lifecycle_status, created_at_utc)
+     values (?, ?, ?, 'system_seed', 'active', ?)
+     on conflict(concept_type, canonical_name) do update
+       set canonical_name = excluded.canonical_name
+       where origin_type = 'system_seed'`,
+  );
+  const selectAlias = db.prepare("select id, source from concept_alias where domain = ? and alias = ?");
+  const upsertAlias = db.prepare(
+    `insert into concept_alias (id, alias, concept_id, domain, mode, source, confirmed_at_utc)
+     values (?, ?, ?, ?, ?, 'seed', NULL)
+     on conflict(domain, alias) do update
+       set concept_id = excluded.concept_id, mode = excluded.mode, source = 'seed'
+       where source = 'seed'`,
+  );
+
+  const summary: { -readonly [K in keyof ConceptTableSummary]: number } = {
+    conceptsInserted: 0,
+    conceptsExisting: 0,
+    aliasesInserted: 0,
+    aliasesExisting: 0,
+    skippedForUserRows: 0,
+  };
+  /** 词表推导的 concept_id -> 库里真实占据该标准名的行 id。 */
+  const resolvedIds = new Map<string, string>();
+
+  for (const entry of entries) {
+    if (entry.entryKind !== "concept") continue;
+    const holder = selectConcept.get(entry.kind, entry.canonicalName) as
+      | { id: string; origin_type: string }
+      | undefined;
+    if (holder === undefined) {
+      upsertConcept.run(entry.conceptId, entry.kind, entry.canonicalName, now);
+      resolvedIds.set(entry.conceptId, entry.conceptId);
+      summary.conceptsInserted += 1;
+      continue;
+    }
+    resolvedIds.set(entry.conceptId, holder.id);
+    if (holder.origin_type === "system_seed") {
+      upsertConcept.run(entry.conceptId, entry.kind, entry.canonicalName, now);
+      summary.conceptsExisting += 1;
+    } else {
+      summary.skippedForUserRows += 1;
+    }
+  }
+
+  for (const entry of entries) {
+    if (entry.entryKind !== "alias" || entry.alias === null || entry.aliasMode === null) continue;
+    const conceptId = resolvedIds.get(entry.conceptId);
+    if (conceptId === undefined) {
+      throw new Error(`别名 ${entry.alias} 的标准概念 ${entry.canonicalName} 未在本次播种中落位`);
+    }
+    const domain = entry.kind;
+    const alias = entry.alias;
+    const holder = selectAlias.get(domain, alias) as { id: string; source: string } | undefined;
+    if (holder !== undefined && holder.source !== "seed") {
+      summary.skippedForUserRows += 1;
+      continue;
+    }
+    upsertAlias.run(seedAliasId(domain, alias), alias, conceptId, domain, entry.aliasMode);
+    if (holder === undefined) summary.aliasesInserted += 1;
+    else summary.aliasesExisting += 1;
+  }
+
+  return summary;
+}
+
+/**
+ * 词表播种：一个事务里既写「词表声明了什么」的水位（M0 交付物 4），
+ * 也把标准名与别名落成真正的 Concept / ConceptAlias 行（M2，Spec §9.3）。
+ * 水位让声明在数据层可查、可重放、可检测变化；两张业务表是归一化与图谱的真实入口。
+ */
+function runInTransaction<T>(db: Database, body: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = body();
+    db.exec("COMMIT");
+    return result;
+  } catch (cause) {
+    db.exec("ROLLBACK");
+    throw cause;
+  }
+}
+
 export function seedVocabulary(
   db: Database,
   contracts: Contracts = loadContracts(),
@@ -92,8 +202,7 @@ export function seedVocabulary(
   let inserted = 0;
   let unchanged = 0;
   let changed = 0;
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  const tables = runInTransaction(db, () => {
     for (const entry of entries) {
       const existing = select.get(entry.watermarkKey) as { content_sha256: string } | undefined;
       if (existing === undefined) inserted += 1;
@@ -113,11 +222,8 @@ export function seedVocabulary(
     }
     setMeta(db, "contracts_fingerprint", contracts.fingerprint);
     setMeta(db, "vocab_seeded_at", now);
-    db.exec("COMMIT");
-  } catch (cause) {
-    db.exec("ROLLBACK");
-    throw cause;
-  }
+    return backfillConceptTables(db, entries, now);
+  });
 
   return {
     inserted,
@@ -128,6 +234,7 @@ export function seedVocabulary(
     autoAliases: entries.filter((e) => e.aliasMode === "auto").length,
     suggestAliases: entries.filter((e) => e.aliasMode === "suggest").length,
     fingerprint: contracts.fingerprint,
+    tables,
   };
 }
 

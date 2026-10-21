@@ -5,7 +5,13 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { ensureConfigFile } from "../src/server/config/config.ts";
 import { resolveDataLayout, type DataLayout } from "../src/server/config/paths.ts";
-import { countRows, makeSandbox, openSandboxDb, type Sandbox } from "./helpers/sandbox.ts";
+import {
+  HEAD_SCHEMA_VERSION,
+  countRows,
+  makeSandbox,
+  openSandboxDb,
+  type Sandbox,
+} from "./helpers/sandbox.ts";
 import { boot, shutdown } from "../src/server/runtime/bootstrap.ts";
 
 /**
@@ -114,8 +120,8 @@ describe("进程内启动与优雅关闭", () => {
 
     const first = await boot({ env, log: () => {} });
     try {
-      expect(first.schemaVersion).toBe(1);
-      expect(await health(port)).toMatchObject({ status: "ok", schemaVersion: 1 });
+      expect(first.schemaVersion).toBe(HEAD_SCHEMA_VERSION);
+      expect(await health(port)).toMatchObject({ status: "ok", schemaVersion: HEAD_SCHEMA_VERSION });
       expect(existsSync(layout.lockFile)).toBe(true);
     } finally {
       await shutdown(first);
@@ -127,7 +133,7 @@ describe("进程内启动与优雅关闭", () => {
     await shutdown(second);
     const db = openSandboxDb(layout);
     try {
-      expect(countRows(db, "schema_migrations")).toBe(1);
+      expect(countRows(db, "schema_migrations")).toBe(HEAD_SCHEMA_VERSION);
     } finally {
       db.close();
     }
@@ -152,9 +158,9 @@ describe("子进程级真实启动", () => {
     const first = startChild(sandbox.root);
     const firstOutput = collect(first);
     await until(() => firstOutput.stdout.includes("/api/health"));
-    expect(firstOutput.stdout).toContain("执行迁移 1 份");
+    expect(firstOutput.stdout).toContain(`执行迁移 ${HEAD_SCHEMA_VERSION} 份`);
     expect(firstOutput.stdout).toContain("TB_DATA_DIR 覆盖");
-    expect(await health(port)).toMatchObject({ status: "ok", schemaVersion: 1 });
+    expect(await health(port)).toMatchObject({ status: "ok", schemaVersion: HEAD_SCHEMA_VERSION });
     const dbBytes = readFileSync(sandbox.layout.dbFile).length;
 
     first.kill();

@@ -3,7 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { applyPragmas, openDatabase, type Database } from "../../src/server/db/adapter.ts";
+import { listMigrationFiles } from "../../src/server/db/migrator.ts";
 import { resolveDataLayout, type DataLayout } from "../../src/server/config/paths.ts";
+
+/**
+ * 迁移目录里的最高版本号 = 应用当前应有的 schema 版本。
+ * 断言「启动后库已升到最新」的测试用它，避免每加一个迁移就回头改一遍与语义无关的字面量；
+ * 真正钉住迁移文件清单的是 m0-migration-seed 里的硬编码列表。
+ */
+export const HEAD_SCHEMA_VERSION = listMigrationFiles().at(-1)!.version;
 
 export interface Sandbox {
   readonly root: string;
@@ -51,7 +59,34 @@ export function openSandboxDb(layout: DataLayout): Database {
   return db;
 }
 
-const KNOWN_TABLES = new Set(["schema_migrations", "app_meta", "vocab_seed_watermark"]);
+const KNOWN_TABLES = new Set([
+  "schema_migrations",
+  "app_meta",
+  "vocab_seed_watermark",
+  // M1（0002）业务表——E-05 授权的「测试随 schema 演进」同步点。
+  "capture_record",
+  "record_revision",
+  "deletion_audit",
+  // M2（0003）派生层。
+  "cloud_send_grant",
+  "parse_run",
+  "episode",
+  "thought_item",
+  "concept",
+  "concept_alias",
+  "entity",
+  "entity_alias",
+  "emotion_mention",
+  "topic_mention",
+  "entity_mention",
+  "suggestion",
+  "graph_edge",
+  // M2（0004）修正层。
+  "user_scalar_override",
+  "user_collection_patch",
+  // M3（0007）§3.16 触发认定表。
+  "trigger_assertion",
+]);
 
 export function countRows(db: Database, table: string): number {
   if (!KNOWN_TABLES.has(table)) {

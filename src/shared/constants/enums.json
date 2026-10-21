@@ -20,7 +20,7 @@
     "graph_edge_endpoints_must_be": ["Episode", "Concept", "Entity:active"]
   },
 
-  "entity_types": ["person", "organization", "place", "work", "product", "game", "other"],
+  "entity_types": ["person", "organization", "place", "work", "product", "activity", "event", "other"],
   "entity_type_rules": {
     "closed": true,
     "extension_path": "修改本文件 + 迁移 + 测试，不由 LLM 新增",

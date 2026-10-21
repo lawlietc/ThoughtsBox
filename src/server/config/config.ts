@@ -1,12 +1,12 @@
-import { readFileSync } from "node:fs";
-import { copyFileSync } from "node:fs";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import { z } from "zod";
 
 import { ConfigError } from "./errors.ts";
 import type { DataLayout } from "./paths.ts";
+import { isLoopbackUrl, PROVIDER_CALL_PATHS, type ProviderCallPath } from "../ingest/provider.ts";
+import type { JsonObject, JsonValue } from "../privacy/manifest.ts";
 
 /** 仓库根 = 本文件向上到 package.json 所在目录；运行时数据一律不在这里（ADR-015）。 */
 export function projectRoot(): string {
@@ -36,6 +36,53 @@ export const processingConfigSchema = z
   })
   .strict();
 
+/**
+ * params 承载「直送 Provider 的额外请求参数」。取值面收敛成 JSON，不给任意结构；
+ * 递归定义钉在 JsonValue 上，避免 z.unknown 把配置类型退化成 unknown。
+ */
+const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+const jsonObjectSchema: z.ZodType<JsonObject> = z.record(z.string(), jsonValueSchema);
+
+/** 调用路径取值逐字取自 provider.ts 的封闭常量，不在此重抄第二份字面量。 */
+const callPathValues = [
+  PROVIDER_CALL_PATHS[0],
+  ...PROVIDER_CALL_PATHS.slice(1),
+] as [ProviderCallPath, ...ProviderCallPath[]];
+
+/**
+ * 本地 / 云端两档模型配置。顶层 `model` 继续保留给旧配置与单适配器装配；
+ * 一旦出现任一 profile，就以 profile 为对应处理模式的权威配置。
+ */
+export const modelProfileConfigSchema = z
+  .object({
+    enabled: z.boolean(),
+    provider: z.string().min(1),
+    base_url: z.url(),
+    api_key_env: z.string().regex(/^[A-Z][A-Z0-9_]{1,127}$/),
+    request_timeout_ms: z.number().int().min(1000).max(120000),
+    model: z.string().min(1).optional(),
+    call_path: z.enum(callPathValues).optional(),
+    supports_structured_output: z.boolean().optional(),
+    params: jsonObjectSchema.optional(),
+  })
+  .strict();
+
+export type ModelProfileConfig = z.infer<typeof modelProfileConfigSchema>;
+
+/**
+ * M4-TR-1 扩字段全 `.optional()`：旧配置（无 model/call_path/supports/params）照解析，
+ * 兼容性由专测钉。「缺 model/call_path 却 enabled=true」不在这里拒——那是装配期的 fail-fast
+ * （productionProvider），配置层只保证「能解析」，语义完备性在装配时判定。
+ */
 export const modelConfigSchema = z
   .object({
     enabled: z.boolean(),
@@ -45,6 +92,12 @@ export const modelConfigSchema = z
     api_key_env: z.string().regex(/^[A-Z][A-Z0-9_]{1,127}$/),
     cloud_redacted_enabled: z.boolean(),
     request_timeout_ms: z.number().int().min(1000).max(120000),
+    model: z.string().min(1).optional(),
+    call_path: z.enum(callPathValues).optional(),
+    supports_structured_output: z.boolean().optional(),
+    params: jsonObjectSchema.optional(),
+    local_model: modelProfileConfigSchema.optional(),
+    cloud_model: modelProfileConfigSchema.optional(),
   })
   .strict();
 
@@ -72,7 +125,7 @@ function rejectInlineSecrets(raw: unknown, filePath: string): void {
     if (typeof value !== "object" || value === null) return;
     for (const [key, child] of Object.entries(value)) {
       const next = [...path, key];
-      if (SECRETISH_KEYS.includes(key) && next.join(".") !== "model.api_key_env") {
+      if (SECRETISH_KEYS.includes(key) && !next.join(".").endsWith("api_key_env")) {
         offenders.push(next.join("."));
       }
       walk(child, next);
@@ -100,13 +153,56 @@ export function parseAppConfig(raw: unknown, filePath: string): AppConfig {
       fields: zodFields(parsed.error),
     });
   }
-  if (parsed.data.model.enabled && !parsed.data.model.cloud_redacted_enabled) {
+  const model = parsed.data.model;
+  if (model.local_model?.enabled === true && !isLoopbackUrl(model.local_model.base_url)) {
     throw new ConfigError(
-      "model.enabled 为 true 但 cloud_redacted_enabled 为 false：矛盾配置。云端整理必须显式开启（ADR-003）。",
-      { filePath, fields: ["model.enabled", "model.cloud_redacted_enabled"] },
+      "本地模型只允许回环地址；否则私人记录会被发到本机之外。",
+      { filePath, fields: ["model.local_model.base_url"] },
+    );
+  }
+  if (model.cloud_model?.enabled === true && !model.cloud_redacted_enabled) {
+    throw new ConfigError(
+      "云端模型已启用，但 cloud_redacted_enabled 未开启：矛盾配置。",
+      { filePath, fields: ["model.cloud_model.enabled", "model.cloud_redacted_enabled"] },
+    );
+  }
+  const hasProfiles = model.local_model !== undefined || model.cloud_model !== undefined;
+  if (!hasProfiles && model.enabled && !model.cloud_redacted_enabled && !isLoopbackUrl(model.base_url)) {
+    throw new ConfigError(
+      "非回环模型已启用，但 cloud_redacted_enabled 为 false：云端整理必须显式开启（ADR-003）。",
+      { filePath, fields: ["model.enabled", "model.cloud_redacted_enabled", "model.base_url"] },
     );
   }
   return parsed.data;
+}
+
+/**
+ * 设置页与装配层共用同一条「某档当前是什么」的判定，避免 UI 和运行时各写一套回退规则。
+ * 旧配置没有 profile 时，按端点是否回环推导它究竟是本地还是云端。
+ */
+export function effectiveModelProfile(
+  config: AppConfig,
+  mode: "local_model" | "cloud_redacted",
+): ModelProfileConfig {
+  const explicit = mode === "local_model" ? config.model.local_model : config.model.cloud_model;
+  if (explicit !== undefined) return explicit;
+  const loopback = isLoopbackUrl(config.model.base_url);
+  return {
+    enabled:
+      mode === "local_model"
+        ? config.model.enabled && loopback
+        : config.model.enabled && config.model.cloud_redacted_enabled,
+    provider: config.model.provider,
+    base_url: config.model.base_url,
+    api_key_env: config.model.api_key_env,
+    request_timeout_ms: config.model.request_timeout_ms,
+    ...(config.model.model === undefined ? {} : { model: config.model.model }),
+    ...(config.model.call_path === undefined ? {} : { call_path: config.model.call_path }),
+    ...(config.model.supports_structured_output === undefined
+      ? {}
+      : { supports_structured_output: config.model.supports_structured_output }),
+    ...(config.model.params === undefined ? {} : { params: config.model.params }),
+  };
 }
 
 /** 首次启动：从仓库模板生成，绝不写入任何真实值。 */
@@ -118,6 +214,18 @@ export function ensureConfigFile(layout: DataLayout, templatePath = TEMPLATE_CON
     copyFileSync(templatePath, layout.configFile);
   }
   return layout.configFile;
+}
+
+/** 设置页保存模型配置：先完整校验，再以同目录临时文件换入，避免半份 JSON 落盘。 */
+export function writeConfigFile(filePath: string, config: AppConfig): void {
+  const parsed = parseAppConfig(config, filePath);
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(tempPath, filePath);
+  } finally {
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+  }
 }
 
 export interface LoadedConfig {
@@ -147,13 +255,14 @@ export function loadConfigFromPath(
     throw new ConfigError(`配置无法读取或解析：${(cause as Error).message}`, { filePath: resolved });
   }
   const config = parseAppConfig(raw, resolved);
-  const keyName = config.model.api_key_env;
-  const envValue = env[keyName];
-  const apiKey = envValue === undefined || envValue.trim() === "" ? undefined : envValue;
-  if (config.model.enabled && apiKey === undefined) {
+  const cloud = effectiveModelProfile(config, "cloud_redacted");
+  const keyName = cloud.api_key_env;
+  const cloudKey = env[keyName];
+  const apiKey = cloudKey === undefined || cloudKey.trim() === "" ? undefined : cloudKey;
+  if (cloud.enabled && apiKey === undefined) {
     throw new ConfigError(
       `云端整理已开启，但环境变量 ${keyName} 未提供密钥。不会静默降级为本地模式。`,
-      { filePath: resolved, fields: ["model.enabled", keyName] },
+      { filePath: resolved, fields: ["model.cloud_model.enabled", keyName] },
     );
   }
   return { config, filePath: resolved, apiKey };

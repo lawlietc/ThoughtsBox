@@ -1,0 +1,14 @@
+# 行尾契约（2026-10-18 M4-TR-1 验收裁定）：文本一律检出为 LF，与 git blob 一致。
+# 起因：core.autocrlf=true 且无本文件时，checkout 把 0007 迁移落成 CRLF，
+# 使 m3-db-2「对冻结 DDL 做静态正则对账」的那条测试因行尾漂移而红（正则要 `),\n`，实为 `),\r\n`）。
+# 本契约不改任何文件内容语义、不动迁移本体、不放宽测试正则——只是让磁盘与索引一致。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.sqlite binary
+*.db binary
+*.zip binary

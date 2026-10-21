@@ -27,13 +27,57 @@ function bootstrapSql(): string {
   return readFileSync(listMigrationFiles()[0]!.path, "utf8");
 }
 
+/**
+ * 这三份清单是**刻意的硬编码**：新增一个迁移文件必须同时改这里，
+ * 否则「迁移到底改成了什么形状」就退化成自证。E-05 授权的同步点就是这个动作。
+ */
+const MIGRATION_NAMES = [
+  "bootstrap",
+  "records_and_search",
+  "derived_layer",
+  "correction_layer",
+  "override_value_gate",
+  "entity_types_v2",
+  "schema_backfill_m2_debt",
+] as const;
+const CURRENT_SCHEMA_VERSION = MIGRATION_NAMES.length;
+const EXPECTED_TABLES = [
+  "app_meta",
+  "capture_record",
+  "cloud_send_grant",
+  "concept",
+  "concept_alias",
+  "deletion_audit",
+  "emotion_mention",
+  "entity",
+  "entity_alias",
+  "entity_mention",
+  "episode",
+  "graph_edge",
+  "parse_run",
+  "record_fts",
+  "record_fts_config",
+  "record_fts_data",
+  "record_fts_docsize",
+  "record_fts_idx",
+  "record_revision",
+  "schema_migrations",
+  "suggestion",
+  "thought_item",
+  "topic_mention",
+  "trigger_assertion",
+  "user_collection_patch",
+  "user_scalar_override",
+  "vocab_seed_watermark",
+] as const;
+
 describe("迁移机制（M0 交付物 4）", () => {
-  it("空库执行引导迁移，只建引导层三张表", () => {
+  it("空库执行迁移到当前 schema，引导层三表全部建立", () => {
     const db = openSandboxDb(sandbox.layout);
     try {
       const result = migrate(db);
-      expect(result.schemaVersion).toBe(1);
-      expect(result.applied.map((file) => file.name)).toEqual(["bootstrap"]);
+      expect(result.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+      expect(result.applied.map((file) => file.name)).toEqual([...MIGRATION_NAMES]);
       expect(tableExists(db, "schema_migrations")).toBe(true);
       expect(tableExists(db, "app_meta")).toBe(true);
       expect(tableExists(db, "vocab_seed_watermark")).toBe(true);
@@ -42,7 +86,9 @@ describe("迁移机制（M0 交付物 4）", () => {
     }
   });
 
-  it("M0 不提前写入任何业务表", () => {
+  // E-05：表集合断言随每个里程碑同步（M1=0002，M2=0003）——唯一允许的「测试随 schema 演进」点。
+  // record_fts_* 四张是 external-content FTS5 虚表的影子表，列集合由 T-29 契约测试单独守。
+  it("表集合恰好等于当前里程碑预期，不提前写入未来里程碑的业务表", () => {
     const db = openSandboxDb(sandbox.layout);
     try {
       migrate(db);
@@ -51,7 +97,7 @@ describe("迁移机制（M0 交付物 4）", () => {
           name: string;
         }[]
       ).map((row) => row.name);
-      expect(tables.sort()).toEqual(["app_meta", "schema_migrations", "vocab_seed_watermark"]);
+      expect([...tables].sort()).toEqual([...EXPECTED_TABLES].sort());
     } finally {
       db.close();
     }
@@ -62,10 +108,10 @@ describe("迁移机制（M0 交付物 4）", () => {
     try {
       const first = migrate(db);
       const second = migrate(db);
-      expect(first.applied).toHaveLength(1);
+      expect(first.applied).toHaveLength(CURRENT_SCHEMA_VERSION);
       expect(second.applied).toHaveLength(0);
-      expect(countRows(db, "schema_migrations")).toBe(1);
-      expect(currentSchemaVersion(db)).toBe(1);
+      expect(countRows(db, "schema_migrations")).toBe(CURRENT_SCHEMA_VERSION);
+      expect(currentSchemaVersion(db)).toBe(CURRENT_SCHEMA_VERSION);
     } finally {
       db.close();
     }

@@ -4,6 +4,10 @@ import { APP_NAME } from "../../shared/constants/app.ts";
 import type { AppConfig } from "../config/config.ts";
 import type { DataLayout } from "../config/paths.ts";
 import type { SelfCheckReport } from "../runtime/selfCheck.ts";
+import type { Workspace } from "../runtime/workspace.ts";
+import { handleDataRequest } from "./dataRoutes.ts";
+import { handleIngestRequest } from "./ingestRoutes.ts";
+import { handleRecordsRequest } from "./recordsRoutes.ts";
 
 export const HEALTH_PATH = "/api/health";
 
@@ -20,8 +24,13 @@ export interface ServerFacts {
   readonly layout: DataLayout;
   readonly config: AppConfig;
   readonly selfCheck: SelfCheckReport;
-  readonly schemaVersion: number;
-  readonly sqliteCtorName: string;
+  /**
+   * 恢复（R-5 整库替换）会在运行中换掉句柄与服务实例，
+   * 路由每个请求都从 workspace 现取现用，而不是在闭包里冻住旧引用。
+   */
+  readonly workspace: Workspace;
+  /** 运行期状态：设置页写盘后标记为需要重启，当前进程不热换 Provider。 */
+  readonly runtime: { configDirty: boolean };
 }
 
 function json(res: import("node:http").ServerResponse, status: number, body: unknown): void {
@@ -47,23 +56,38 @@ export function assertLoopback(host: string): void {
 
 export function createApiServer(facts: ServerFacts): Server {
   const server = createServer((req, res) => {
-    const url = req.url ?? "";
-    if (req.method === "GET" && url === HEALTH_PATH) {
+    const rawUrl = req.url ?? "";
+    if (req.method === "GET" && rawUrl === HEALTH_PATH) {
       json(res, 200, {
         app: APP_NAME,
         status: "ok",
         pid: process.pid,
         node: process.version,
         sqliteVersion: facts.selfCheck.sqliteVersion,
-        sqliteCtor: facts.sqliteCtorName,
-        schemaVersion: facts.schemaVersion,
+        sqliteCtor: facts.workspace.db.ctorName,
+        schemaVersion: facts.workspace.schemaVersion,
         contractsFingerprint: facts.selfCheck.contractsFingerprint,
         dataDir: facts.layout.dataDir,
         boundTo: `${facts.config.server.host}:${facts.config.server.port}`,
       });
       return;
     }
-    json(res, 404, { error: "not_found", path: url });
+    let url: URL;
+    try {
+      url = new URL(rawUrl, `http://${facts.config.server.host}`);
+    } catch {
+      json(res, 404, { error: "not_found", path: rawUrl });
+      return;
+    }
+    handleRecordsRequest(facts.workspace.records, req, res, url)
+      .then((handled) => (handled ? true : handleDataRequest(facts.workspace, req, res, url)))
+      .then((handled) => (handled ? true : handleIngestRequest(facts, req, res, url)))
+      .then((handled) => {
+        if (!handled) json(res, 404, { error: "not_found", path: rawUrl });
+      })
+      .catch(() => {
+        json(res, 500, { error: "internal_error" });
+      });
   });
   // 不在 error 事件里抛错：监听失败由 listen() 转成 PortConflictError 交给调用方处理。
   return server;

@@ -7,23 +7,37 @@ import { applyPragmas, openDatabase, type Database } from "../db/adapter.ts";
 import { currentSchemaVersion, migrate } from "../db/migrator.ts";
 import { seedVocabulary, type SeedSummary } from "../db/seed.ts";
 import { createApiServer, listen } from "../api/httpServer.ts";
+import { RecordService } from "../records/service.ts";
+import { runDataCheck } from "./dataCheck.ts";
 import { runSelfCheck, type SelfCheckReport } from "./selfCheck.ts";
 import { acquireInstanceLock, type HeldLock } from "./singleInstance.ts";
+import { buildProductionProvider } from "./productionProvider.ts";
+import { Workspace, type IngestProviderBundle } from "./workspace.ts";
 
 export interface BootResult {
   readonly layout: DataLayout;
   readonly loaded: LoadedConfig;
   readonly selfCheck: SelfCheckReport;
   readonly held: HeldLock;
-  readonly db: Database;
   readonly server: Server;
-  readonly schemaVersion: number;
   readonly seed: SeedSummary;
+  readonly workspace: Workspace;
+  /** 恢复（R-5）会原位换库，这些访问器永远指向当前活动实例，不是启动时的快照。 */
+  db: Database;
+  schemaVersion: number;
+  records: RecordService;
 }
 
 export interface BootOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly log?: (line: string) => void;
+  /**
+   * Provider 装配注入（M2-6）：显式注入即测试路径（m2-boot/m2-api），走真实的 IngestService 全链路。
+   * **省略时不再是「未装配」**——M4-TR-1 起，省略即由 `buildProductionProvider` 按 `config.model`
+   * 自动装配生产 Provider 面（`enabled=false` 才回落为 null、解析能力未就绪）。
+   * 只影响 Workspace 的装配，不改变任何启动时序——仍在锁与自检之后消费。
+   */
+  readonly ingestProvider?: IngestProviderBundle;
 }
 
 /**
@@ -76,12 +90,43 @@ export async function boot(options: BootOptions = {}): Promise<BootResult> {
     );
 
     const schemaVersion = currentSchemaVersion(db);
+    // 数据面自检（M1b §八）：在迁移与播种之后、对外服务之前。失败即启动失败——
+    // M0 的 fail-fast 契约不因数据面扩展而放宽：不静默降级、不带着坏索引开门。
+    const dataCheck = runDataCheck(db);
+    log(
+      `数据面自检通过：schema v${dataCheck.schemaVersion}，检查 ${dataCheck.passedSteps.length} 项` +
+        (dataCheck.searchIndexRebuilt
+          ? `（搜索索引已自动重建：重建前 幽灵 ${dataCheck.desyncBeforeRebuild?.phantom ?? 0}、缺失 ${dataCheck.desyncBeforeRebuild?.missing ?? 0}）`
+          : ""),
+    );
+    const workspace = new Workspace(
+      layout,
+      db,
+      schemaVersion,
+      options.ingestProvider ?? buildProductionProvider(loaded.config, env),
+    );
+    log(
+      workspace.ingestReady
+        ? "解析能力就绪：Provider 装配已注入"
+        : "解析能力未就绪：未注入 Provider 装配（parse 面将显式拒绝，不假装可发送）",
+    );
+    // 约束二 ⑤：重启后恢复检测待清理任务；与删除服务共用同一幂等重试路径（T-28）。
+    const pendingTasks = workspace.records.getMaintenanceTasks();
+    if (pendingTasks.length > 0) {
+      log(`检测到 ${pendingTasks.length} 项待清理存储维护任务，尝试幂等重试`);
+      const retry = workspace.records.retryStorageMaintenance();
+      log(
+        retry.ok
+          ? `重试完成，清理 ${retry.resolvedTasks} 项待处理任务`
+          : `重试仍失败（${retry.detail}），可在 /api/storage-maintenance/retry 再次触发`,
+      );
+    }
     const server = createApiServer({
       layout,
       config: loaded.config,
       selfCheck,
-      schemaVersion,
-      sqliteCtorName: db.ctorName,
+      workspace,
+      runtime: { configDirty: false },
     });
     await listen(server, loaded.config.server.host, loaded.config.server.port);
     log(`服务已启动：http://${loaded.config.server.host}:${loaded.config.server.port}/api/health（${Date.now() - started}ms）`);
@@ -91,10 +136,18 @@ export async function boot(options: BootOptions = {}): Promise<BootResult> {
       loaded,
       selfCheck,
       held,
-      db,
       server,
-      schemaVersion,
       seed,
+      workspace,
+      get db() {
+        return workspace.db;
+      },
+      get schemaVersion() {
+        return workspace.schemaVersion;
+      },
+      get records() {
+        return workspace.records;
+      },
     };
   } catch (cause) {
     // 锁是本进程拿到的，任何后续失败都要立即释放，否则崩溃残留只能靠接管规则回收。

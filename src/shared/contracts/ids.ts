@@ -51,6 +51,17 @@ export function seedConceptId(canonicalName: string): string {
   return `concept_seed_${hash.slice(0, 12)}`;
 }
 
+/**
+ * 种子别名例外：同样确定性，好让 `(域, 别名)` 在任何安装里落到同一个标识。
+ * 唯一键其实是 (domain, alias)，标识只是它的派生值。
+ */
+export function seedAliasId(domain: "emotion" | "topic", alias: string): string {
+  const hash = createHash("sha256")
+    .update(`${domain}\u0000${alias}`.normalize("NFC"))
+    .digest("hex");
+  return `ca_seed_${hash.slice(0, 12)}`;
+}
+
 export function hasPrefix(id: string, kind: IdKind): boolean {
   return id.startsWith(`${ID_PREFIXES[kind]}_`);
 }

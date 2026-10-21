@@ -1,6 +1,14 @@
+# 不公开的文档
+docs/dev-specs/
+docs/specs/
+docs/adr/
+docs/Product-concept/
+
+
 # 依赖与构建产物
 node_modules/
 dist/
+dist-prototype/
 coverage/
 *.tsbuildinfo
 .npm-cache/
@@ -32,4 +40,10 @@ Thumbs.db
 # 本地临时目录
 scratch/
 /tmp/
+
+# 本地协作工具的会话日志（非项目产物）
 .qoder/
+.claude/
+.codebuddy/
+.codegraph/
+.codex/
