@@ -1,6 +1,6 @@
 {
   "name": "thoughts-box",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "思绪盒子 Thoughts Box — 本地优先的个人思绪整理工具（V0）",
   "type": "module",
   "engines": {
