@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { ApiError, api } from "./apiClient.ts";
+import { noticeForError, errorStatusOf } from "./notices.ts";
 import { RecordDetail } from "./RecordDetail.tsx";
 import { RecordList } from "./RecordList.tsx";
 import { dayHeading, deletePhaseMessage, recordListMeta, toRowView } from "./projections.ts";
@@ -8,6 +9,7 @@ import { ListDetail } from "./ui/ListDetail.tsx";
 import { useIsNarrow } from "./ui/bits.tsx";
 import { useRecords } from "./useRecords.ts";
 import type { StorageMaintenanceTask } from "../shared/dto.ts";
+import type { NoticeInput } from "./useNotices.ts";
 
 /**
  * 「全部记录」：以记录为单位，按创建时间倒序，展示处理状态（布局对齐原型的记录页）。
@@ -27,13 +29,19 @@ export interface RecordsPanelProps {
   readonly onSelect: (id: string | null) => void;
   /** 记录内容或状态变了：父层要重取外壳徽章（待整理计数）。 */
   readonly onBadgesChanged: () => void;
+  /** 统一反馈面（挂在 App 的 `useNotices`）。这一页不再自己存一份 flash。 */
+  readonly notify: (input: NoticeInput) => void;
+  readonly clearScope: (scope: string) => void;
+  /** 409 那一类「这一页做不了」的下一步：跳「待整理」。 */
+  readonly onGoPending: () => void;
+  /** 详情页的「编辑原文」：写是独占动作，跳独立子页面（父层路由，面板不自己跳）。 */
+  readonly onEdit: () => void;
 }
 
 export function RecordsPanel(props: RecordsPanelProps): React.ReactNode {
   const narrow = useIsNarrow();
   const feed = useRecords();
 
-  const [flash, setFlash] = useState<string | null>(null);
   const [pendingTasks, setPendingTasks] = useState<StorageMaintenanceTask[]>([]);
   const [retrying, setRetrying] = useState(false);
 
@@ -50,12 +58,6 @@ export function RecordsPanel(props: RecordsPanelProps): React.ReactNode {
     void reloadMaintenance();
   }, [reloadMaintenance]);
 
-  useEffect(() => {
-    if (flash === null) return;
-    const timer = setTimeout(() => setFlash(null), 6000);
-    return () => clearTimeout(timer);
-  }, [flash]);
-
   // 宽屏两栏同屏，没选中就落到第一条，详情永远有内容；窄屏只有用户点过才算选中。
   const selected = props.selectedId ?? (narrow ? null : (feed.rows[0]?.id ?? null));
 
@@ -69,13 +71,21 @@ export function RecordsPanel(props: RecordsPanelProps): React.ReactNode {
     setRetrying(true);
     try {
       const result = await api.retryMaintenance();
-      setFlash(
+      props.notify(
         result.ok
-          ? `存储清理重试完成，处理 ${result.resolvedTasks} 项。`
-          : `存储清理仍需处理${result.detail ? `（${result.detail}）` : ""}，可稍后再次重试。`,
+          ? { tone: "ok", message: `存储清理重试完成，处理 ${result.resolvedTasks} 项。` }
+          : {
+              tone: "error",
+              message: `存储清理仍需处理${result.detail ? `（${result.detail}）` : ""}，可稍后再次重试。`,
+              action: { label: "再试一次", onClick: () => void retryMaintenance() },
+            },
       );
     } catch (cause) {
-      setFlash(cause instanceof ApiError ? `重试失败：${cause.detail}` : "重试失败");
+      props.notify(
+        noticeForError(cause instanceof ApiError ? cause.detail : "重试失败", errorStatusOf(cause), {
+          retry: () => void retryMaintenance(),
+        }),
+      );
     }
     await reloadMaintenance();
     setRetrying(false);
@@ -99,7 +109,6 @@ export function RecordsPanel(props: RecordsPanelProps): React.ReactNode {
               </button>
             </div>
           )}
-          {flash !== null && <p className="flash">{flash}</p>}
 
           <section className="card">
             <h2>记录（{feed.total}）</h2>
@@ -133,16 +142,33 @@ export function RecordsPanel(props: RecordsPanelProps): React.ReactNode {
         ) : (
           <RecordDetail
             id={selected}
+            notify={props.notify}
+            clearScope={props.clearScope}
+            onGoPending={props.onGoPending}
+            onEdit={props.onEdit}
             onChanged={() => {
               void feed.reload();
               props.onBadgesChanged();
             }}
             onDeleted={(result) => {
               props.onSelect(null);
+              props.clearScope(selected);
               void feed.reload();
               void reloadMaintenance();
               props.onBadgesChanged();
-              setFlash(deletePhaseMessage(result));
+              const receipt: NoticeInput = {
+                tone: "ok",
+                message: deletePhaseMessage(result),
+              };
+              props.notify(
+                result.phaseB.status === "failed_unpersisted"
+                  ? {
+                      ...receipt,
+                      tone: "error",
+                      action: { label: "立即重试清理", onClick: () => void retryMaintenance() },
+                    }
+                  : receipt,
+              );
             }}
           />
         )

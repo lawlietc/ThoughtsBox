@@ -10,6 +10,12 @@
     { "type": "possibly_related", "carrier": "GraphEdge", "source": "Episode", "target": "Episode", "directed": false, "creators": ["suggestion_then_user"] },
     { "type": "same_as", "carrier": "GraphEdge", "source": "Entity", "target": "Entity", "directed": false, "creators": ["user"] },
     { "type": "merged_into", "carrier": "GraphEdge", "source": "Concept", "target": "Concept", "directed": true, "creators": ["user"] },
+    { "type": "colleague_of", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": false, "creators": ["ai_generated", "user"] },
+    { "type": "friend_of", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": false, "creators": ["ai_generated", "user"] },
+    { "type": "family_of", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": false, "creators": ["ai_generated", "user"] },
+    { "type": "partner_of", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": false, "creators": ["ai_generated", "user"] },
+    { "type": "classmate_of", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": false, "creators": ["ai_generated", "user"] },
+    { "type": "reports_to", "carrier": "GraphEdge", "source": "Entity:active", "target": "Entity:active", "directed": true, "creators": ["ai_generated", "user"] },
     { "type": "triggered_by", "carrier": "TriggerAssertion", "source": "EmotionMention", "target": "Episode", "directed": true, "creators": ["user"] },
     { "type": "possibly_same_as", "carrier": "Suggestion", "source": "Entity", "target": "Entity", "directed": false, "creators": ["ai_suggestion"] }
   ],
@@ -116,7 +122,47 @@
     }
   },
 
-  "processing_modes": ["manual_only", "local_model", "cloud_redacted"],
+  "processing_modes": ["manual_only", "local_model", "cloud_redacted", "cloud_raw"],
+  "analysis_providers": ["local", "cloud", "none"],
+  "redaction_modes": ["local_llm", "manual", "none"],
+  "send_content_modes": ["redacted", "raw", "none"],
+  "three_axis_rules": {
+    "note": "M6-0C：analysis_provider / redaction_mode / send_content_mode 是记录级唯一判定源；processing_mode 降级为派生兼容字段（草案 §五）。判定分支只读三轴，代码评审时禁止新增 processing_mode 分支。矩阵行的 axes 顺序为 analysis_provider | redaction_mode | send_content_mode。",
+    "spec_ref": "docs/dev-specs/2026-10-23-M6-0C-三轴契约设计草案.md §二 §三 §四 §五 §八之三",
+    "placeholder_unimplemented": [],
+    "placeholder_note": "M9-4b 起 redaction_mode=local_llm 有实现，占位清单为空（M9-D-11）：三个取值全部在册，判定机制保留——本清单与代码侧 UNIMPLEMENTED_REDACTION_MODES 由 validateEnums 逐值对账，空对空仍然相等，下一次真出现占位档时不必再改契约。analysis_provider=local 仍只对应既有 external_http（用户自备回环服务），不内置运行时。矩阵 #3/#5/#8 的可达性因此改由配置决定：model.local_llm 未配置 / 已关闭 / 端点非回环 / 缺 model ⇒ 装配层在产生任何副作用之前显式拒绝（409 redaction_mode_unavailable + 封闭 reason 枚举），绝不静默降级成 manual 档。",
+    "send_content_mode_note": "send_content_mode 不描述本地路径：本地分析不发生外发，即使分析用的是脱敏文本也是 none。",
+    "send_content_mode_domains": "两个定义域，不是一份清单：记录轴 redacted|raw|none；cloud_send_grant.send_content_mode 列只有 redacted|raw（不发送就没有授权行）。授权表列定义在 0D，不得引用本清单当同一份，否则出现「三值 CHECK 里塞两值」的漂移。",
+    "egress_gate": "send_content_mode ≠ none 即内容离开本机，raw 与 redacted 都必须走「预览 + 本次授权」闸门；闸门按 send_content_mode 判定，不按 processing_mode 字面量。",
+    "combination_matrix": [
+      { "row": 1, "axes": "none|none|none", "legal": true, "reason": "只保存原文，不脱敏不分析" },
+      { "row": 2, "axes": "none|manual|none", "legal": true, "reason": "手动标记后只存本机，不分析" },
+      { "row": 3, "axes": "none|local_llm|none", "legal": true, "reason": "本地只做脱敏，不做内容分析" },
+      { "row": 4, "axes": "local|manual|none", "legal": true, "reason": "本地分析 + 规则/实体脱敏文本" },
+      { "row": 5, "axes": "local|local_llm|none", "legal": true, "reason": "本地全链路：LLM 候选 + 本地分析" },
+      { "row": 6, "axes": "local|none|none", "legal": false, "reason": "R2 裁决：v1 本地分析必须使用脱敏文本，此组合等于用原文分析" },
+      { "row": 7, "axes": "cloud|manual|redacted", "legal": true, "reason": "传统云端路径" },
+      { "row": 8, "axes": "cloud|local_llm|redacted", "legal": true, "reason": "本地 LLM 脱敏 + 云端分析（本方案的主推路径）" },
+      { "row": 9, "axes": "cloud|none|raw", "legal": true, "reason": "用户明确选择「不脱敏，发送原文」" },
+      { "row": 10, "axes": "cloud|manual|raw", "legal": false, "reason": "自相矛盾：既做了脱敏又不使用" },
+      { "row": 11, "axes": "cloud|local_llm|raw", "legal": false, "reason": "同 #10" },
+      { "row": 12, "axes": "cloud|none|redacted", "legal": false, "reason": "没有发生脱敏，却声称发送的是脱敏文本" }
+    ],
+    "matrix_completeness": "矩阵只列 12 行，三轴全空间是 27 个组合：未列出的 15 个（例如 none 分析却外发、local 分析却外发、cloud 分析却不外发）一律按非法实现。装载时逐组合对账，实现若放行任何未列出的组合即报错。",
+    "derived_processing_mode": [
+      "none|*|* => manual_only",
+      "local|*|* => local_model",
+      "cloud|*|redacted => cloud_redacted",
+      "cloud|none|raw => cloud_raw"
+    ],
+    "legacy_axis_mapping": [
+      "manual_only => none|manual|none",
+      "local_model => local|manual|none",
+      "cloud_redacted => cloud|manual|redacted"
+    ],
+    "legacy_axis_mapping_note": "0008 一次性回填依据（草案 §四）。local_model 的行为自 R2 起变化：本地模型此前看原文，此后看脱敏文本，须在发布说明中点名。不在三值内的脏数据一律按 manual_only 处理并在迁移报告里列出行数。",
+    "cloud_raw_is_separate_value": "cloud_raw 必须作为独立枚举值，不能由 cloud_redacted 承载原文发送：否则授权与脱敏语义在同一个值上互相覆盖。"
+  },
   "processing_statuses": [
     "captured",
     "awaiting_privacy_review",
@@ -130,7 +176,8 @@
   "processing_rules": {
     "independent": "processing_status 与 processing_mode 与 CloudSendGrant 三者独立，不得互相推断",
     "manual_only_not_pending": "manual_only 的记录不计入待整理",
-    "grant_is_per_content": "cloud_redacted 需要逐版本的本次发送授权；内容或脱敏策略变化后旧授权失效"
+    "grant_is_per_content": "cloud_redacted 需要逐版本的本次发送授权；内容或脱敏策略变化后旧授权失效。M6-0C 起判定源换成 send_content_mode：任何非 none 的外发（redacted 与 raw）都要逐版本的本次授权。",
+    "processing_mode_is_derived": "M6-0C：processing_mode 是 three_axis_rules.derived_processing_mode 的派生只读兼容字段，写入由三轴派生，读取方（DTO/UI/trace 兼容面）继续可用；判定不再分支它。cloud_raw 与 cloud_redacted 在 trace/DTO/UI 上必须可区分。"
   },
 
   "suggestion_kinds": ["emotion_candidate", "alias", "new_concept", "possibly_related", "possibly_same_as", "evidence_repair"],

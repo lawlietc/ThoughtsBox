@@ -56,10 +56,11 @@ export const BOX_SUB_TABS: readonly { readonly key: ViewKey; readonly label: str
 
 /**
  * 不在任何标签栏里的页面：`quick`（快速记录）与 `sleep`（睡前收尾）是**动作**，
- * 入口在「今天」那一页上；`overview` 是沟通件自己的目录页，产品里没有它。
+ * 入口在「今天」那一页上；`edit`（编辑原文）是**写**这个动作，入口在记录详情里；
+ * `overview` 是沟通件自己的目录页，产品里没有它。
  * 进去之后得自带「回去」的动作。
  */
-export const STANDALONE: readonly ViewKey[] = ["quick", "sleep", "overview"];
+export const STANDALONE: readonly ViewKey[] = ["quick", "sleep", "edit", "overview"];
 
 /** 某个页面属于哪个主 tab；不属于任何 tab 的返回 `null`。 */
 export function tabOf(view: ViewKey): TabKey | null {
@@ -70,6 +71,8 @@ export function tabOf(view: ViewKey): TabKey | null {
     case "ingest":
     case "suggestions":
     case "sleep":
+    // 编辑是「全部记录 / 待整理」里那一条的下一步，这两页都在「今天」这条线上。
+    case "edit":
       return "today";
     case "emotions":
     case "episodes":

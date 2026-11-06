@@ -8,6 +8,7 @@ import { ensureConfigFile } from "../src/server/config/config.ts";
 import type { DataLayout } from "../src/server/config/paths.ts";
 import { IngestService } from "../src/server/ingest/ingestService.ts";
 import { makeSandbox, type Sandbox } from "./helpers/sandbox.ts";
+import { createProvisionalEntity } from "./helpers/entityFixtures.ts";
 import {
   FIXTURE_NOW,
   LOCAL_RAW,
@@ -15,13 +16,18 @@ import {
   SYSTEM_PROMPT,
   envelopeOf,
   makeAdapter,
+  setRecordMode,
   stubTransport,
   validOutput,
 } from "./helpers/ingestFixtures.ts";
 import type { StructuredOutput } from "../src/server/ingest/contract.ts";
 
 import {
+  CHIP_LIMIT,
+  COUNT_ONLY_CATEGORIES,
+  WORD_LEVEL_CATEGORIES,
   evidencePhrase,
+  foldChips,
   MENTION_SOURCE_PHRASE,
   productBoxPage,
   productSuggestions,
@@ -37,6 +43,7 @@ import {
   MENTION_STATUS_LABEL,
 } from "../src/web/ui/labels.ts";
 import type { EffectiveEvidenceDto, EffectiveResultDto, RecordRow } from "../src/shared/dto.ts";
+import { axesForProcessingMode } from "../src/shared/contracts/enums.ts";
 
 /**
  * M3-PROJ-1 可读投影补全的验收面。
@@ -161,9 +168,7 @@ async function makeRecord(text: string, mode?: string): Promise<{ recordId: stri
   await ensureShared();
   const created = booted!.workspace.records.createRecord(text);
   if (mode !== undefined) {
-    booted!.db
-      .prepare("update capture_record set processing_mode = ? where id = ?")
-      .run(mode, created.record.id);
+    setRecordMode(booted!.db, created.record.id, mode);
   }
   return { recordId: created.record.id, revisionId: created.revision.id };
 }
@@ -180,7 +185,7 @@ async function parsedAndAdopted(
   mode = "local_model",
 ): Promise<{ recordId: string; revisionId: string; runId: string; effective: EffectiveResultDto }> {
   const { recordId, revisionId } = await makeRecord(text, mode);
-  const parse = await call("POST", "/api/ingest/parse", { recordId });
+  const parse = await call("POST", "/api/ingest/parse", { recordId, autoAdoptFirstResult: false });
   expect(parse.json.succeeded, parse.text).toBe(true);
   const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
   expect(adopt.status, adopt.text).toBe(200);
@@ -318,14 +323,10 @@ describe("A. op9 可读扩集：§六 清单逐项（真 HTTP + 真解析）", (
 
   it("实体另需 role：库里没写就是 null，写了就原样带出（B2/I5 可空自由文本）", async () => {
     const { recordId, revisionId } = await makeRecord(LOCAL_RAW, "local_model");
-    // 先让「项目组」成为一个可解析的实体（RED-1 的应用内通道，不手写 entity 行）。
-    const confirm = await call("POST", "/api/ingest/confirm-candidates", {
-      recordId,
-      adopted: [{ term: "项目组", kind: "organization" }],
-    });
-    expect(confirm.status, confirm.text).toBe(201);
+    // 先让「项目组」成为一个可解析的实体（产品侧的确认入口已删，测试直接写同形 provisional 行）。
+    createProvisionalEntity(booted!.db, "项目组", "organization");
 
-    const parse = await call("POST", "/api/ingest/parse", { recordId });
+    const parse = await call("POST", "/api/ingest/parse", { recordId, autoAdoptFirstResult: false });
     expect(parse.json.succeeded).toBe(true);
     const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
     expect(adopt.status).toBe(200);
@@ -400,8 +401,10 @@ describe("A. op9 可读扩集：§六 清单逐项（真 HTTP + 真解析）", (
     expect(parse.json.succeeded, parse.text).toBe(true);
     expect(parse.json.title).toBe("关于发布计划的讨论");
 
-    const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
-    expect(adopt.status).toBe(200);
+    if (parse.json.autoAdopted !== true) {
+      const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
+      expect(adopt.status).toBe(200);
+    }
 
     const effective = await effectiveOf(revisionId);
     expect(effective.aiTitle).toBe(parse.json.title);
@@ -490,7 +493,7 @@ describe("B. 同一口径：readableView 的集合 == currentView 的集合", ()
 
   it("候选没采纳时两侧一样读不到（「列表数得出、点进去看不到」在结构上不可能）", async () => {
     const { recordId, revisionId } = await makeRecord(LOCAL_RAW, "local_model");
-    const ok = await call("POST", "/api/ingest/parse", { recordId });
+    const ok = await call("POST", "/api/ingest/parse", { recordId, autoAdoptFirstResult: false });
     expect(ok.json.succeeded, ok.text).toBe(true);
 
     const effective = await effectiveOf(revisionId);
@@ -526,7 +529,7 @@ describe("C. /api/ingest/adopt 与 /api/ingest/discard", () => {
 
   it("放弃 200：candidate→superseded，原文与派生行一根毛都没动（§4.7b 不是删除）", async () => {
     const { recordId, revisionId } = await makeRecord(LOCAL_RAW, "local_model");
-    const parse = await call("POST", "/api/ingest/parse", { recordId });
+    const parse = await call("POST", "/api/ingest/parse", { recordId, autoAdoptFirstResult: false });
     const runId = parse.json.runId as string;
 
     const episodes = booted!.db
@@ -560,7 +563,7 @@ describe("C. /api/ingest/adopt 与 /api/ingest/discard", () => {
 
   it("错误面四类可自动化区分：400 / 404 / 409（放弃再放弃、采纳已采纳的都撞门）", async () => {
     const { recordId } = await makeRecord(LOCAL_RAW, "local_model");
-    const parse = await call("POST", "/api/ingest/parse", { recordId });
+    const parse = await call("POST", "/api/ingest/parse", { recordId, autoAdoptFirstResult: false });
     const runId = parse.json.runId as string;
 
     const badBody = await call("POST", "/api/ingest/adopt", { candidateRunId: 123 });
@@ -646,8 +649,10 @@ describe("D. 红线①：pipeline_manifest 物理跳过（云端映射真在库�
     // 所以红线① 的探测器按**结构键名**扫，词面那一侧归红线② 管。
     expect(run.m).not.toContain("13800138000");
 
-    const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
-    expect(adopt.status).toBe(200);
+    if (parse.json.autoAdopted !== true) {
+      const adopt = await call("POST", "/api/ingest/adopt", { candidateRunId: parse.json.runId });
+      expect(adopt.status).toBe(200);
+    }
 
     const effective = await call("GET", `/api/ingest/effective/${revisionId}`);
     expect(effective.status).toBe(200);
@@ -665,7 +670,8 @@ describe("D. 红线①：pipeline_manifest 物理跳过（云端映射真在库�
       expect(jsonKeys(res.json).some((k) => LEAKY_KEYS.includes(k)), `${where} 递归键名里有映射结构`).toBe(false);
     };
     expectNoMap(effective, "op9");
-    expectNoMap(adopt, "adopt");
+    // Phase B：首次自动生效时没有 adopt 响应可扫；解析响应本身同样不许出现映射结构。
+    expectNoMap(parse, "parse");
     expectNoMap(discard, "discard");
   });
 
@@ -736,6 +742,19 @@ describe("F. 红线③：一份 DTO，两个数据源，假侧不冒充就绪", 
       expect(body, `假侧不该自己填 ${added}`).not.toContain(added);
     }
     expect(body).toContain("currentRunId: null");
+    // 〔web-redesign 第二步 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-详情页分层试点.md〕
+    // 上面那段切片判的是**默认**那一份，红线原样在。这一轮新增的只有一个默认关的样张开关
+    // （`?rich=1`，读它的只有 dev 入口 `fakeDataEntry.tsx`）。判据从「源码里的先后顺序」换成
+    // 「开关默认关 + 挂上路由必须过开关」——比原来更硬，不是更松：
+    expect(fake).toContain("let FAKE_RICH_RESULT = false;");
+    expect(fake).toContain("export function setFakeRichResult(on: boolean): void");
+    expect(fake, "样张那份投影只在开关为真时才挂到路由上").toContain(
+      "FAKE_RICH_RESULT ? recordByRevisionId(revisionId) : null",
+    );
+    expect(fake).toContain("ingestReady: FAKE_RICH_RESULT || FAKE_CONFIG.ingestReady");
+    expect(webSource("fakeDataEntry.tsx"), "这个参数只许住在 dev 入口那一层").toContain(
+      'new URLSearchParams(window.location.search).has("rich")',
+    );
     // 消费面对「没有」的反应是诚实空态，而不是零行冒充「确实没有内容」。
     const legacyOnly: EffectiveResultDto = JSON.parse(
       JSON.stringify({
@@ -784,6 +803,7 @@ function evid(text: string): EffectiveEvidenceDto {
 }
 
 function fakeRecord(id: string, date = "2026-10-17"): RecordRow {
+  const axes = axesForProcessingMode("local_model");
   return {
     id,
     created_at_utc: `${date}T02:00:00.000Z`,
@@ -794,6 +814,10 @@ function fakeRecord(id: string, date = "2026-10-17"): RecordRow {
     processing_status: "parsed",
     processing_mode: "local_model",
     privacy_level: "normal",
+    // M6-0C：三轴是事实源，派生列与之成对出现（0008 的表级 CHECK 在库里就是这么要求的）。
+    analysis_provider: axes.analysisProvider,
+    redaction_mode: axes.redactionMode,
+    send_content_mode: axes.sendContentMode,
   };
 }
 
@@ -1139,7 +1163,94 @@ describe("G. productBoxPage / productSuggestions：与形状表同一套口径",
 });
 
 /* ════════════════════════════════════════════════════════════════════
- * H. 取数方式：N+1 已消 + 本轮不开 0008
+ * G2. 整理结果栏默认可见的那一层（web-redesign 批 5 · 裁定 R3 / R6）
+ *
+ * 默认面只回答两件事：短词类「具体是哪些词」、长句类「各有几个」。
+ * 这里钉的是数据那一侧（哪些类别带 chip、折几个、按什么顺序折），
+ * 版面在 390 / 1440 的走查里看。
+ * ════════════════════════════════════════════════════════════════════ */
+
+describe("G2. 默认可见的 chip 行：谁显示词、谁只报数量", () => {
+  const emotionItem = (index: number, basis: string, status: string) => ({
+    id: `csm_chip_${index}`,
+    conceptId: `con_chip_${index}`,
+    labelSaid: `原话${index}`,
+    basis,
+    status,
+    source: { kind: "record_revision" as const, containerId: "rev_of_rec_a" },
+    evidence: evid("我感到焦虑"),
+    intensity: null,
+    intensityModifiedByUser: false,
+  });
+
+  const emotionLines = (items: readonly ReturnType<typeof emotionItem>[]) =>
+    readableResult(baseEffective({ emotionItems: [...items] })).find((group) => group.category === "情绪")!.lines;
+
+  it("分法逐字等于裁定，且两类合起来正好是那五类", () => {
+    expect(WORD_LEVEL_CATEGORIES).toEqual(["情绪", "主题"]);
+    expect(COUNT_ONLY_CATEGORIES).toEqual(["经历", "念头", "人物与事物"]);
+    const five = readableResult(baseEffective()).map((group) => group.category);
+    expect([...WORD_LEVEL_CATEGORIES, ...COUNT_ONLY_CATEGORIES].sort()).toEqual([...five].sort());
+  });
+
+  it("只有短词类带 chip：长句类的词是句子或专名，一个都不进默认面", () => {
+    const groups = readableResult(baseEffective());
+    const byCategory = new Map(groups.map((group) => [group.category, group]));
+    for (const category of WORD_LEVEL_CATEGORIES) {
+      const line = byCategory.get(category)!.lines[0]!;
+      expect(line.chip, `${category} 应当带 chip`).toBeDefined();
+      expect(line.chip!.label.length).toBeGreaterThan(0);
+      // chip 面是标准名，tooltip 里的原话才是证据回溯的那个词 —— 与折叠件那一行同源。
+      expect(line.title).toBe(`「${line.chip!.said}」→ ${line.chip!.label}`);
+      expect(line.chip!.status).toBe("active");
+    }
+    for (const category of COUNT_ONLY_CATEGORIES) {
+      for (const line of byCategory.get(category)?.lines ?? []) {
+        expect(line.chip, `${category} 不该带 chip`).toBeUndefined();
+      }
+    }
+  });
+
+  it("一行最多 6 个；折走的一定是猜测（排序 explicit → inferred → 已移除）", () => {
+    expect(CHIP_LIMIT).toBe(6);
+    const lines = emotionLines([
+      emotionItem(0, "inferred", "active"),
+      emotionItem(1, "explicit", "active"),
+      emotionItem(2, "explicit", "rejected"),
+      emotionItem(3, "inferred", "active"),
+      emotionItem(4, "explicit", "active"),
+      emotionItem(5, "explicit", "active"),
+      emotionItem(6, "inferred", "active"),
+      emotionItem(7, "explicit", "active"),
+    ]);
+    const folded = foldChips(lines);
+    expect(folded.shown).toHaveLength(6);
+    expect(folded.hidden).toBe(2);
+    // 4 个 explicit-active 全在明面上，且排在最前；被折走的是一个 inferred 与那个已移除。
+    expect(folded.shown.slice(0, 4).every((line) => line.chip!.basis === "explicit")).toBe(true);
+    expect(folded.shown.every((line) => line.chip!.status === "active")).toBe(true);
+    expect(folded.shown.map((line) => line.id)).toEqual([
+      "csm_chip_1",
+      "csm_chip_4",
+      "csm_chip_5",
+      "csm_chip_7",
+      "csm_chip_0",
+      "csm_chip_3",
+    ]);
+  });
+
+  it("没超过 6 个就原样给，不重排、不折叠", () => {
+    const lines = emotionLines([
+      emotionItem(0, "inferred", "active"),
+      emotionItem(1, "explicit", "rejected"),
+      emotionItem(2, "explicit", "active"),
+    ]);
+    expect(foldChips(lines)).toEqual({ shown: lines, hidden: 0 });
+  });
+});
+
+/* ════════════════════════════════════════════════════════════════════
+ * H. 取数方式：N+1 已消 + 回锚成功不落列（0008 是三轴契约，与此无关）
  * ════════════════════════════════════════════════════════════════════ */
 
 describe("H. 批量取数与「缺列即停」", () => {
@@ -1175,10 +1286,15 @@ describe("H. 批量取数与「缺列即停」", () => {
     }
   });
 
-  it("本轮明令不开 0008：迁移目录停在 0007，缺的那一列（是否回锚成功）在投影里现算", () => {
+  it("0008 是三轴契约迁移，不是「回锚成功」列：缺的那一列仍在投影里现算", () => {
     const files = readdirSync(MIGRATIONS).filter((name) => name.endsWith(".sql")).sort();
-    expect(files.at(-1)!.startsWith("0007")).toBe(true);
-    expect(files.some((name) => name.startsWith("0008"))).toBe(false);
+    // M6-0C 改的是这条断言的**取值**（不是它的方向）：0008 是三轴契约、0009 是授权表的内容轴（0D），
+    // 两者都没有给证据补「回锚成功」列，所以那一列仍然只能在投影里现算。
+    // 判据从「最后一个文件的名字」换成「整目录的 SQL 文本里没有这类列」——方向不变，覆盖面更宽。
+    const allSql = files.map((name) => readFileSync(join(MIGRATIONS, name), "utf8")).join("\n");
+    expect(allSql).not.toMatch(/evidence_anchored|evidence_verified|anchored_evidence/);
+    expect(files.some((name) => name.startsWith("0008_three_axis"))).toBe(true);
+    expect(files.some((name) => name.startsWith("0009_send_content_mode"))).toBe(true);
     const service = readFileSync(join(SERVER_DIR, "ingest", "ingestService.ts"), "utf8");
     expect(service).toContain("rawText.slice(start, end) === text");
   });

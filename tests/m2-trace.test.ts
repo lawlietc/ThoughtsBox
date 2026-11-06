@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { loadEnums } from "../src/shared/contracts/load.ts";
+import { axesForProcessingMode } from "../src/shared/contracts/enums.ts";
 import {
   BUSINESS_RULES,
   BusinessValidationError,
@@ -74,6 +75,7 @@ const MODEL_OUTPUT: StructuredOutput = {
   emotions: [{ labelSaid: "焦虑", candidateConceptId: null, basis: "explicit", evidence: "那一刻很焦虑" }],
   topics: [],
   entities: [],
+  relations: [],
 };
 
 /** 结构合法、业务非法：依据是编造的，落败原因本身也不得进 Trace。 */
@@ -98,6 +100,8 @@ const ADAPTER: ModelAdapter = {
 function makeRequest(payloadText: string, signal?: AbortSignal): ExtractionRequest {
   return {
     recordRevisionId: "rev_trace_fixture",
+    // 三轴是判定源（草案 §二）：夹具按既有模式反推，本次 run 的语义与改动前逐字相同。
+    axes: axesForProcessingMode("local_model"),
     processingMode: "local_model",
     payloadText,
     systemPrompt: "你是提取器，只输出 JSON。",
@@ -211,6 +215,8 @@ describe("§11.1 Trace 字段面：每项都对应一个定位能力，多一项
     { requirement: "业务校验结果", fields: ["businessValidation"] },
     { requirement: "派生数据写入是否提交", fields: ["derivedWriteCommitted"] },
     { requirement: "错误类别、可重试性及相关安全诊断信息", fields: ["errorKind", "retryable", "diagnostics"] },
+    // 草案 §八-1 拍板：排障要能审计「这次到底按哪三轴装配」，三键随 0008 一起进字段面。
+    { requirement: "本次 run 的三轴装配（判定源，processingMode 只是派生兼容字段）", fields: ["analysisProvider", "redactionMode", "sendContentMode"] },
   ];
 
   for (const probe of TRACEABILITY) {
@@ -224,7 +230,7 @@ describe("§11.1 Trace 字段面：每项都对应一个定位能力，多一项
   it("字段面恰好等于「§11.1 要求」∪「§5.2 处理模式 + ADR-006 路径记录」，不留无来由的键", () => {
     const justified = [...TRACEABILITY.flatMap((probe) => probe.fields), "processingMode", "callPath", "attemptedPaths", "degraded"];
     expect(symmetricDiff(justified, [...TRACE_ENTRY_FIELDS]), `差集：${symmetricDiff(justified, [...TRACE_ENTRY_FIELDS]).join(",")}`).toEqual([]);
-    expect(TRACE_ENTRY_FIELDS.length).toBe(18);
+    expect(TRACE_ENTRY_FIELDS.length).toBe(21);
   });
 
   it("序列化后逐键读回：键集合仍在封闭集内，取值原样可定位", () => {
@@ -788,11 +794,11 @@ describe("M2-4b 取值门：封闭集字段的取值不在册即拒，报错落�
 
   it("processingMode 的门确实取自 enums.json：trace.ts 里没有第二份处理模式清单", () => {
     const source = readFileSync(TRACE_SOURCE, "utf8");
-    expect(ENUMS.processing_modes).toEqual(["manual_only", "local_model", "cloud_redacted"]);
-    // 取的是 enums 的字段名与运行时读取入口，而不是把三个值抄进 trace.ts
+    expect(ENUMS.processing_modes).toEqual(["manual_only", "local_model", "cloud_redacted", "cloud_raw"]);
+    // 取的是 enums 的字段名与运行时读取入口，而不是把四个值抄进 trace.ts
     expect(source).toMatch(/processing_modes/);
     expect(source).toMatch(/contracts\/load\.ts/);
-    for (const literal of ["manual_only", "local_model", "cloud_redacted"]) {
+    for (const literal of ENUMS.processing_modes as string[]) {
       expect(source, `trace.ts 不该出现第二份清单字面量：${literal}`).not.toContain(literal);
     }
   });

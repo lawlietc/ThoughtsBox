@@ -14,6 +14,7 @@ import {
 } from "../src/server/config/config.ts";
 import { ConfigError } from "../src/server/config/errors.ts";
 import { resolveDataLayout } from "../src/server/config/paths.ts";
+import { DEFAULT_API_KEY_ENV } from "../src/shared/constants/model.ts";
 
 let root: string | undefined;
 
@@ -80,7 +81,7 @@ describe("配置加载（M0 交付物 5）", () => {
     expect(text).toContain("REPLACE_WITH");
     expect(text).not.toMatch(/sk-/);
     const parsed = parseAppConfig(raw, TEMPLATE_CONFIG_PATH);
-    expect(parsed.model.api_key_env).toBe("TB_MODEL_API_KEY");
+    expect(parsed.model.api_key_env).toBe(DEFAULT_API_KEY_ENV);
   });
 
   it("首次启动从模板生成 config.local.json，二次启动不覆盖", () => {
@@ -157,7 +158,7 @@ describe("配置加载（M0 交付物 5）", () => {
     } catch (cause) {
       expect(cause).toBeInstanceOf(ConfigError);
       expect((cause as ConfigError).fields).toContain("model.api_key");
-      expect((cause as Error).message).toContain("环境变量");
+      expect((cause as Error).message).toContain("设置页");
     }
   });
 
@@ -172,19 +173,48 @@ describe("配置加载（M0 交付物 5）", () => {
       base_url: "https://example.invalid/v1",
     };
     writeFileSync(layout.configFile, JSON.stringify(raw), "utf8");
-    expect(() => loadConfig(layout, {})).toThrow(/TB_MODEL_API_KEY/);
-    const withKey = loadConfigFromPath(layout.configFile, { TB_MODEL_API_KEY: "secret" });
+    expect(() => loadConfig(layout, {})).toThrow(/没有可用密钥/);
+    const withKey = loadConfigFromPath(layout.configFile, { [DEFAULT_API_KEY_ENV]: "secret" });
     expect(withKey.apiKey).toBe("secret");
   });
 
-  it("双 profile 配置可解析；只启用本地档时不要求云端密钥", () => {
+  it("双 profile 配置可解析；只启用本地档时不要求云端密钥，旧变量名统一收敛默认值", () => {
     const layout = layoutWith(sandboxDataDir());
     ensureConfigFile(layout);
     writeFileSync(layout.configFile, JSON.stringify(dualProfileRaw()), "utf8");
     const loaded = loadConfigFromPath(layout.configFile, {});
     expect(loaded.config.model.local_model?.enabled).toBe(true);
     expect(loaded.config.model.cloud_model?.enabled).toBe(false);
+    expect(loaded.config.model.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(loaded.config.model.local_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(loaded.config.model.cloud_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
     expect(loaded.apiKey).toBeUndefined();
+  });
+
+  it("配置文件完全省略 api_key_env 也照常解析并补默认值", () => {
+    const raw = dualProfileRaw();
+    const model = raw.model as Record<string, unknown>;
+    delete model.api_key_env;
+    delete (model.local_model as Record<string, unknown>).api_key_env;
+    delete (model.cloud_model as Record<string, unknown>).api_key_env;
+
+    const parsed = parseAppConfig(raw, "inline");
+    expect(parsed.model.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(parsed.model.local_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(parsed.model.cloud_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+  });
+
+  it("旧文件里的自定义或非法变量名都不再参与校验，统一收敛默认值", () => {
+    const raw = dualProfileRaw();
+    const model = raw.model as Record<string, unknown>;
+    model.api_key_env = "not a valid env name";
+    (model.local_model as Record<string, unknown>).api_key_env = "legacy-local";
+    (model.cloud_model as Record<string, unknown>).api_key_env = "";
+
+    const parsed = parseAppConfig(raw, "inline");
+    expect(parsed.model.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(parsed.model.local_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(parsed.model.cloud_model?.api_key_env).toBe(DEFAULT_API_KEY_ENV);
   });
 
   it("本地 profile 启用时必须是回环地址", () => {
@@ -229,5 +259,39 @@ describe("配置加载（M0 交付物 5）", () => {
     const same = resolveDataLayout({ TB_DATA_DIR: "  " });
     expect(same.envOverride).toBe(false);
     expect(() => resolveDataLayout({ TB_DATA_DIR: process.cwd() })).toThrow(/仓库根/);
+  });
+});
+
+describe("M9-6a-2 顶层旧字段 request_timeout_ms 的上限与 profile 那份一致", () => {
+  /** `model.request_timeout_ms` 是 primary profile 的镜像字段：设置页允许的值，配置层必须收得下。 */
+  function rawWithTopLevelTimeout(ms: number): Record<string, unknown> {
+    const raw = dualProfileRaw();
+    (raw.model as Record<string, unknown>).request_timeout_ms = ms;
+    return raw;
+  }
+
+  it("手写配置 200000 能被 parseAppConfig 接受（两层真的一致，而不只是路由放行）", () => {
+    expect(parseAppConfig(rawWithTopLevelTimeout(200000), "inline").model.request_timeout_ms).toBe(
+      200000,
+    );
+  });
+
+  it("上限本身 300000 能解析并原样落盘回读", () => {
+    const layout = layoutWith(sandboxDataDir());
+    ensureConfigFile(layout);
+    const config = parseAppConfig(rawWithTopLevelTimeout(300000), layout.configFile);
+    expect(config.model.request_timeout_ms).toBe(300000);
+    writeConfigFile(layout.configFile, config);
+    const saved = JSON.parse(readFileSync(layout.configFile, "utf8")) as {
+      model: { request_timeout_ms: number };
+    };
+    expect(saved.model.request_timeout_ms).toBe(300000);
+  });
+
+  it.each<[string, number]>([
+    ["高于新上限 300000", 300001],
+    ["低于下限 1000", 999],
+  ])("顶层旧字段 %s（=%d）⇒ ConfigError，域不是无限宽", (_label, ms) => {
+    expect(() => parseAppConfig(rawWithTopLevelTimeout(ms), "inline")).toThrow(ConfigError);
   });
 });

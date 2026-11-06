@@ -2,6 +2,16 @@ import { createHash } from "node:crypto";
 
 import { newId } from "../../shared/contracts/ids.ts";
 import { loadEnums } from "../../shared/contracts/load.ts";
+import {
+  assertThreeAxes,
+  axesForProcessingMode,
+  coerceAxes,
+  deriveProcessingMode,
+  isEgress,
+  isProcessingModeValue,
+  type ProcessingModeValue,
+  type ThreeAxes,
+} from "../../shared/contracts/enums.ts";
 import type {
   DeletePhaseResult,
   RecordRow,
@@ -16,6 +26,23 @@ import { purgePreviewCache } from "../privacy/grantService.ts";
 
 // M1b：行形状上收为前后端共用契约（src/shared/dto.ts）；此处 re-export 保持既有导入路径可用。
 export type { DeletePhaseResult, RecordRow, RevisionRow, StorageMaintenanceTask } from "../../shared/dto.ts";
+
+/**
+ * 新建记录 / 改档时的**产品默认**三轴（2026-11-04，Phase A-0）。
+ *
+ * `cloud_redacted` 默认走 `local_llm`：云端脱敏的语义层只有本机模型，规则层只遮格式类。
+ * 本机模型不可用时，预览/解析会被 `assertRedactionPlanRunnable` 以 409 挡住（PD-2），
+ * 不会静默退回 `manual`——这正是「阻断」的含义。
+ *
+ * 为什么不动 `enums.json` 的 `legacy_axis_mapping`：那份映射是「手里只有 processing_mode」
+ * 的导入兼容入口（JSONL 备份、旧测试夹具），继续按原值工作；新记录才走这个默认。
+ */
+function axesForNewRecord(mode: ProcessingModeValue): ThreeAxes {
+  if (mode === "cloud_redacted") {
+    return { analysisProvider: "cloud", redactionMode: "local_llm", sendContentMode: "redacted" };
+  }
+  return axesForProcessingMode(mode);
+}
 
 export class RecordValidationError extends Error {
   constructor(detail: string) {
@@ -106,6 +133,15 @@ export interface RecordServiceOptions {
   readonly timezoneId?: string;
   /** Phase B 注入点：测试据此验证「清理失败 ≠ 回滚」，生产默认走 adapter 的 checkpoint。 */
   readonly storageMaintenance?: (db: Database) => void;
+  /**
+   * M10-1（裁决 M10-D-1）：保存之后的通知——`createRecord` / `editRecord` 各产生一个新版本，
+   * 在**写事务提交之后**带着那个新版本 id 调一次。装配层用它把本机预跑排进队列。
+   *
+   * 依赖方向是硬的：`records/service.ts` 不许 import 模型层，所以这里只有一个 id 的回调，
+   * 没有任何「要不要预跑」的判断（判据住在被注入的那一侧，读的就是这条记录的三轴）。
+   * 缺省不注入 ⇒ 保存路径与今天逐字相同。回调**抛异常不许冒泡**：预跑失败不能把一次保存搞失败。
+   */
+  readonly onRevisionSaved?: (revisionId: string) => void;
 }
 
 const STORAGE_MAINTENANCE_KEY = "storage_maintenance_pending";
@@ -120,6 +156,7 @@ export class RecordService {
   private readonly now: () => Date;
   private readonly timezoneId: string;
   private readonly maintainStorage: (db: Database) => void;
+  private readonly onRevisionSaved: ((revisionId: string) => void) | undefined;
 
   constructor(db: Database, options: RecordServiceOptions = {}) {
     this.db = db;
@@ -127,6 +164,20 @@ export class RecordService {
     this.timezoneId =
       options.timezoneId ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
     this.maintainStorage = options.storageMaintenance ?? ((handle) => checkpointAndTruncate(handle));
+    this.onRevisionSaved = options.onRevisionSaved;
+  }
+
+  /**
+   * 提交后的通知（M10-1）：缺席即什么都不做；异常一律就地吞掉——保存已经成功了，
+   * 不能被一个下游的预跑排程搞成失败。正文不进日志（N-6），这里连日志都不记。
+   */
+  private notifyRevisionSaved(revisionId: string): void {
+    if (this.onRevisionSaved === undefined) return;
+    try {
+      this.onRevisionSaved(revisionId);
+    } catch {
+      /* 预跑排程失败 ≠ 保存失败 */
+    }
   }
 
   private timestamps(): RecordTimestamps {
@@ -148,9 +199,18 @@ export class RecordService {
     return text;
   }
 
-  /** mode 取值一律回到 enums.json 单一事实源校验，不接受第二份字面量表。 */
-  static validateMode(mode: unknown): string {
+  /**
+   * mode 取值一律回到 enums.json 单一事实源校验，不接受第二份字面量表。
+   * 返回类型收成 `ProcessingModeValue`：调用方要据此派生三轴（草案 §五），
+   * `string` 返回值等于把「已核对过」这个事实又丢回给运行时。
+   */
+  static validateMode(mode: unknown): ProcessingModeValue {
     if (typeof mode !== "string" || !processingModes().includes(mode)) {
+      throw new InvalidProcessingModeError();
+    }
+    if (!isProcessingModeValue(mode)) {
+      // enums.json 有、`contracts/enums.ts` 的常量没有（或反之）——装载时的 T-16 对账本该拦住这件事，
+      // 真走到这里说明对账失效。不猜类型、不静默放行（禁区「不放宽既有取值门」的同一取向）。
       throw new InvalidProcessingModeError();
     }
     return mode;
@@ -162,9 +222,14 @@ export class RecordService {
   ): { record: RecordRow; revision: RevisionRow } {
     const body = RecordService.validateText(text);
     const chosen = mode === undefined ? "manual_only" : RecordService.validateMode(mode);
-    // §4.8：cloud 建记录即进 awaiting_privacy_review（captured→awaiting 是登记边）；
-    // 其余两档沿用 DDL 缺省 captured。缺省路径与扩参前逐字同值。
-    const initialStatus = chosen === "cloud_redacted" ? "awaiting_privacy_review" : "captured";
+    // 三轴是事实源，`processing_mode` 是它的派生读数（草案 §五）。旧值映射（§四）在这里逐字保留：
+    // manual_only→(none,manual,none) / local_model→(local,manual,none) / cloud_redacted→(cloud,manual,redacted)，
+    // 新增的 cloud_raw→(cloud,none,raw)。派生与合法性由 0008 的两条表级 CHECK 在库里再钉一遍。
+    const axes = axesForNewRecord(chosen);
+    // §4.8：外发档建记录即进 awaiting_privacy_review（captured→awaiting 是登记边）；
+    // 其余沿用 DDL 缺省 captured。判定读三轴，不写 `=== "cloud_redacted"` 字面量——
+    // 但对既有三档而言结果逐字不变（`cloud_raw` 是唯一新增的外发档）。缺省路径与扩参前同值。
+    const initialStatus = isEgress(axes) ? "awaiting_privacy_review" : "captured";
     if (initialStatus !== "captured" && !isStateTransitionAllowed("processing_status", "captured", initialStatus)) {
       throw new RecordStateConflictError(`§4.8 未登记 captured → ${initialStatus}，建记录不得自创状态边`);
     }
@@ -177,12 +242,27 @@ export class RecordService {
       this.db
         .prepare(
           `insert into capture_record (id, created_at_utc, created_at_local, timezone_id, created_local_date,
-                                       current_revision_id, processing_mode, processing_status)
-           values (?, ?, ?, ?, ?, ?, ?, ?)`,
+                                       current_revision_id, processing_mode, processing_status,
+                                       analysis_provider, redaction_mode, send_content_mode)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(recordId, ts.utc, ts.local, ts.timezoneId, ts.localDate, revisionId, chosen, initialStatus);
+        .run(
+          recordId,
+          ts.utc,
+          ts.local,
+          ts.timezoneId,
+          ts.localDate,
+          revisionId,
+          chosen,
+          initialStatus,
+          axes.analysisProvider,
+          axes.redactionMode,
+          axes.sendContentMode,
+        );
       this.insertRevision(revisionId, recordId, 1, body, sha, tokens, ts);
     });
+    // 先提交、后通知：回调那一侧要读库，读到的必须已经是刚写进去的这一版（B12）。
+    this.notifyRevisionSaved(revisionId);
     return {
       record: this.getRecordRow(recordId),
       revision: this.getRevisionRow(revisionId),
@@ -222,6 +302,9 @@ export class RecordService {
         .run(revisionId, status, recordId);
     });
     const record = this.getRecordRow(recordId);
+    // 只有真的建了版才通知：空 diff 那一次没有新版本，重排预跑等于给同一版再做一次
+    // 「模型没跑成 ⇒ 再问一遍」，而那正是 M10-D-7 明令不做的自动重试。
+    if (changed) this.notifyRevisionSaved(record.current_revision_id);
     return { record, revision: this.getRevisionRow(record.current_revision_id), changed };
   }
 
@@ -246,17 +329,63 @@ export class RecordService {
         );
       }
       let to = from;
-      if (from === "captured" && chosen === "cloud_redacted") {
+      // 外发判定读三轴（草案 §五）：`cloud_raw` 与 `cloud_redacted` 同样需要「先确认再发」，
+      // 既有三档的流转结果逐字不变。
+      const egress = isEgress(axesForNewRecord(chosen));
+      if (from === "captured" && egress) {
         to = "awaiting_privacy_review";
-      } else if (from === "awaiting_privacy_review" && chosen !== "cloud_redacted") {
+      } else if (from === "awaiting_privacy_review" && !egress) {
         to = "not_processed";
       }
       if (to !== from && !isStateTransitionAllowed("processing_status", from, to)) {
         throw new RecordStateConflictError(`§4.8 未登记 ${from} → ${to}，改模式不得自创转换`);
       }
+      const axes = axesForNewRecord(chosen);
       this.db
-        .prepare("update capture_record set processing_mode = ?, processing_status = ? where id = ?")
-        .run(chosen, to, recordId);
+        .prepare(
+          `update capture_record
+              set processing_mode = ?, processing_status = ?,
+                  analysis_provider = ?, redaction_mode = ?, send_content_mode = ?
+            where id = ?`,
+        )
+        .run(chosen, to, axes.analysisProvider, axes.redactionMode, axes.sendContentMode, recordId);
+      changed = true;
+    });
+    return { record: this.getRecordRow(recordId), changed };
+  }
+
+  /**
+   * M9-4d-2（裁决 M9-D-15）：**单独**改这一条记录的脱敏档。
+   *
+   * 存在的理由：`processing_mode` 是四值封闭集且由三轴派生，`(cloud, local_llm, redacted)` 与
+   * `(cloud, manual, redacted)` 派生后同为 `cloud_redacted`，界面因此表达不出「这次用本地模型脱敏」。
+   * 再加一个 mode 值等于改 0008 的 CHECK（禁区），于是「谁来做脱敏」从「在哪分析」里拆出来，
+   * 落在这一条只动 `redaction_mode` 一列的窄入口上。
+   *
+   * 三条边界：
+   * - **只改一轴**：`analysis_provider` / `send_content_mode` 逐字取在册值不动，派生的
+   *   `processing_mode` 按改后的三轴重算（与 `setProcessingMode` 同一手法）；
+   * - **判据是既有的那两道门**：`coerceAxes` 收窄取值（不在册即拒，不静默兜底成保守组合），
+   *   `assertThreeAxes` 核对组合（草案 §三 矩阵）。不成立时一个字节都不写——校验在任何写语句之前；
+   * - **无副作用**：`redaction_mode` 不参与外发判定（`isEgress` 只看 `send_content_mode`），
+   *   所以 `processing_status` 必然不动；这里不调 Provider、不写 grant、不清预览缓存。
+   *   预览缓存留给上一档那份载荷：新档的载荷哈希不同，既有四腿核对自然让旧授权失效。
+   */
+  setRedactionMode(recordId: string, mode: unknown): { record: RecordRow; changed: boolean } {
+    if (typeof mode !== "string") {
+      throw new RecordValidationError("redaction_mode 必须是字符串");
+    }
+    let changed = false;
+    this.inTransaction(() => {
+      const record = this.getRecordRow(recordId);
+      // 同值 ⇒ 幂等，不写库（`changed:false`，与 `setProcessingMode` 的口径一致）。
+      if (record.redaction_mode === mode) return;
+      const axes = coerceAxes(record.analysis_provider, mode, record.send_content_mode);
+      assertThreeAxes(axes);
+      const processingMode = deriveProcessingMode(axes);
+      this.db
+        .prepare(`update capture_record set redaction_mode = ?, processing_mode = ? where id = ?`)
+        .run(axes.redactionMode, processingMode, recordId);
       changed = true;
     });
     return { record: this.getRecordRow(recordId), changed };
@@ -305,6 +434,53 @@ export class RecordService {
       .all(...recordIds) as unknown as Array<{ record_id: string; raw_text: string }>;
     for (const row of rows) found.set(row.record_id, row.raw_text);
     return found;
+  }
+
+  /**
+   * 一次取齐这批记录**当前版本**的修订号（M10-2 复核队列：一行要说清「看的是第几版」）。
+   *
+   * 与 `currentRawTexts` 同一个手法、同两张事实表：列表要 N 行时不逐条 `getRecord`
+   * （那会把每条记录的全部历史版本都读一遍只为拿当前那一版）。只读，不动任何状态。
+   */
+  currentRevisionNumbers(recordIds: readonly string[]): Map<string, number> {
+    const found = new Map<string, number>();
+    if (recordIds.length === 0) return found;
+    const rows = this.db
+      .prepare(
+        `select cr.id as record_id, rr.revision_number as revision_number
+           from capture_record as cr
+           join record_revision as rr on rr.id = cr.current_revision_id
+          where cr.id in (${recordIds.map(() => "?").join(", ")})`,
+      )
+      .all(...recordIds) as unknown as Array<{ record_id: string; revision_number: number }>;
+    for (const row of rows) found.set(row.record_id, row.revision_number);
+    return found;
+  }
+
+  /**
+   * 这一版**所属记录**的三轴（M10-1：预跑队列判定「这一条现在还要不要算」的唯一数据来源）。
+   *
+   * 只读：join `record_revision` → `capture_record` 两张事实表，不碰派生层，不写任何状态。
+   * 为什么这个读法住在记录服务而不是队列里：列名与取值门是记录面的契约，队列自己写 SQL 等于
+   * 在模型层再抄一份「怎么从库里读轴」——两处抄本漂移时没有任何测试会拦住。
+   *
+   * `null` = 这一版不在册（记录已被硬删除）。**不抛**：被删是「意图变了」，不是错误，
+   * 调用方据此静默跳过（断言 B8）。在册但取值不在封闭集内 ⇒ 由 `coerceAxes` 抛，
+   * 与路由侧 `axesOfRecord` 读侧那道门同取向——不静默兜底成保守组合。
+   */
+  axesOfRevision(recordRevisionId: string): ThreeAxes | null {
+    const row = this.db
+      .prepare(
+        `select cr.analysis_provider, cr.redaction_mode, cr.send_content_mode
+           from record_revision as rr
+           join capture_record as cr on cr.id = rr.record_id
+          where rr.id = ?`,
+      )
+      .get(recordRevisionId) as
+      | { analysis_provider: string; redaction_mode: string; send_content_mode: string }
+      | undefined;
+    if (row === undefined) return null;
+    return coerceAxes(row.analysis_provider, row.redaction_mode, row.send_content_mode);
   }
 
   /**

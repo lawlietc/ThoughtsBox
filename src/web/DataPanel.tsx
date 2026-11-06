@@ -79,7 +79,6 @@ export function DataPanel(): React.ReactNode {
   return (
     <section className="card">
       <h2>数据与备份</h2>
-      <p className="hint">备份、导出与导入都只在本机进行；恢复和导入仍会逐项确认，不使用静默覆盖。</p>
       {notice !== null && <p className="warn">{notice}</p>}
 
       <h3>备份与恢复</h3>
@@ -238,7 +237,7 @@ export function DataPanel(): React.ReactNode {
       <DisclosureNote summary="说明">
         <p className="hint">导出含对象类型与版本引用；删除审计与运行期维护任务不随导出迁移。</p>
       </DisclosureNote>
-      <p className="hint">仅支持导入空数据库；先全量校验，任何一行有错都不会写入。</p>
+      <p className="hint">仅支持导入空数据库。</p>
       <div className="actions">
         <input
           ref={fileRef}

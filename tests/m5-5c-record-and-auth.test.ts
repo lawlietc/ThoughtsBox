@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { dayHeading, needsAttention, recordListMeta } from "../src/web/projections.ts";
+import { axesForProcessingMode, isProcessingModeValue } from "../src/shared/contracts/enums.ts";
 import type { RecordRow } from "../src/shared/dto.ts";
 
 const WEB = join(process.cwd(), "src", "web");
@@ -13,6 +14,9 @@ function source(name: string): string {
 }
 
 function recordRow(over: Partial<RecordRow> = {}): RecordRow {
+  const mode = over.processing_mode ?? "manual_only";
+  if (!isProcessingModeValue(mode)) throw new Error(`夹具写入了契约外的 processing_mode：${mode}`);
+  const axes = axesForProcessingMode(mode);
   return {
     id: "rec_000000000000000000000000000001",
     created_at_utc: "2026-10-16T05:04:05.123Z",
@@ -21,8 +25,12 @@ function recordRow(over: Partial<RecordRow> = {}): RecordRow {
     created_local_date: "2026-10-16",
     current_revision_id: "rev_000000000000000000000000000001",
     processing_status: "captured",
-    processing_mode: "manual_only",
+    processing_mode: mode,
     privacy_level: "normal",
+    // M6-0C：派生列与三轴必须成对出现（0008 的表级 CHECK 在库里就是这么要求的）。
+    analysis_provider: axes.analysisProvider,
+    redaction_mode: axes.redactionMode,
+    send_content_mode: axes.sendContentMode,
     ...over,
   };
 }
@@ -64,26 +72,32 @@ describe("M5-5C · 云端授权以最新预览为准", () => {
   it("没有可适用授权时，云端整理按钮不可点", () => {
     expect(ingest).toContain("const canStartOrganize =");
     expect(ingest).toContain("preview?.hasApplicableGrant === true");
-    expect(ingest).toContain("disabled={busy || !canStartOrganize}");
+    // 〔web-redesign 第三步〕主键在缺授权时由阶段机判为 `needs-grant`：点它只打开确认框、
+    // 不发请求；真正会外发的「排到后台」那颗仍由 `canStartOrganize` 钉死。
+    expect(ingest).toContain("disabled={busy || !canStartOrganize || !stagePrimaryEnabled(stage)}");
+    expect(ingest).toContain("disabled={busy || !stagePrimaryEnabled(stage)}");
   });
 
-  it("重新预览、确认候选和记录变更都会清掉旧 grant", () => {
-    const previewAt = ingest.indexOf("onPreview={() =>");
-    const candidatesAt = ingest.indexOf("onConfirmCandidates={(adopted)");
+  it("重新预览和记录变更都会清掉旧 grant", () => {
+    // 〔web-redesign 第三步〕原来的 `onPreview` 入口换成了 `refetchPreview`（页面自己驱动重取），
+    // 清授权这件事没有变；记录变更仍走 `onChanged`。
+    const refetchAt = ingest.indexOf("async function refetchPreview");
+    expect(refetchAt).toBeGreaterThanOrEqual(0);
+    expect(ingest.slice(refetchAt, refetchAt + 500)).toContain("setGrant(null)");
     const changedAt = ingest.indexOf("onChanged={() =>");
-    for (const at of [previewAt, candidatesAt]) {
-      expect(at).toBeGreaterThanOrEqual(0);
-      expect(ingest.slice(at, at + 500)).toContain("setGrant(null)");
-    }
     expect(changedAt).toBeGreaterThanOrEqual(0);
     expect(ingest.slice(changedAt, changedAt + 500)).toContain("resetDetail()");
   });
 
   it("409 只给用户一句可行动的话，服务端内部原因收进技术详情", () => {
-    expect(ingest).toContain("cause.status === 409");
-    expect(ingest).toContain("这次发送需要重新确认");
-    expect(ingest).toContain("errorDetail");
-    expect(ingest).toContain('["服务端原文", errorDetail]');
-    expect(ingest).toContain('["原文 revision", preview.recordRevisionId]');
+    // 〔S7〕409 的映射收进 `failureActions.ts`（按服务端错误码，不按状态码二次分类）：
+    // 主文案说人话，错误码 / `detail` 只放进折叠的技术详情。
+    const failure = source("failureActions.ts");
+    expect(failure).toContain('case "state_conflict":');
+    expect(failure).toContain("这一步现在不能做");
+    expect(failure).toContain("cause.detail");
+    expect(failure).toContain("function technicalOf(");
+    expect(ingest).toContain("failurePlanOf");
+    expect(ingest).toContain("FailureSurface");
   });
 });

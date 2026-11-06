@@ -7,13 +7,17 @@
  *
  * 本模块只做四件事，且每件只有一处实现：
  *
- * 1. **闸门**：`processing_mode` 取记录在册的用户设置；`manual_only` 与回环违例由
- *    `assertSendable` 在任何写入之前拒；云端路径在本层补上 Provider 层无法强制的
- *    「必带脱敏映射」门（M2-4 复审裁决 3），授权缺失同样是零写入。
+ * 1. **闸门**：判定源是记录在册的**三轴**（M6-0C / 草案 §二、§五）；`resolveMode` /
+ *    `resolveAxes` 只允许调用方**核对**在册值，不允许替用户改隐私承诺。
+ *    `analysis_provider=none`、本地分析配非回环端点、占位而未实现的 `redaction_mode`
+ *    由 `assertSendable` 在任何写入之前拒；任何一次外发（`send_content_mode ≠ none`，
+ *    `raw` 与 `redacted` 皆然）在本层补上 Provider 层无法强制的「必带载荷 + 必带本次授权」门，
+ *    `redacted` 另补「必带脱敏映射」门（M2-4 复审裁决 3），缺任何一件都是零写入。
  * 2. **ParseRun 生命周期**：`idempotency_key = f(revision, fingerprint)`，命中即复用同一行
  *    （§7.1）；崩溃遗留的 `running` 走 running→failed→queued→running 的合法链恢复。
  * 3. **派生写入**：一个事务内完成 run→succeeded + Episode/ThoughtItem/Mention/Suggestion +
- *    记录态→parsed（指令 §8.2「任务半途失败不得留下部分有效的对象」）。
+ *    `graph_edge` 关系边（M7-2b，准则 §3.5）+ 记录态→parsed（指令 §8.2「任务半途失败不得留下
+ *    部分有效的对象」）。
  * 4. **采纳与放弃**：`candidate→current` 与旧 `current→superseded` 同事务切换（§3.19 第 4 步），
  *    带用户修正的旧行一律不被动（§3.19 第 2 步）。
  *
@@ -30,10 +34,25 @@ import {
   type PatchCollection,
 } from "../correction/service.ts";
 import type { Database } from "../db/adapter.ts";
+import type { LocalLlmStatus } from "../config/config.ts";
 import { loadContracts, type Contracts } from "../../shared/contracts/load.ts";
+import {
+  assertThreeAxes,
+  coerceAxes,
+  deriveProcessingMode,
+  isEgress,
+  type ThreeAxes,
+} from "../../shared/contracts/enums.ts";
 import { newId } from "../../shared/contracts/ids.ts";
 import { pipelineFingerprint, type PipelineManifest } from "../privacy/manifest.ts";
-import { parseRedactionMap, redactionMapJsonValue, type RedactionMap } from "../privacy/redaction.ts";
+import {
+  parseRedactionMap,
+  redactionMapJsonValue,
+  SEMANTIC_REDACTION_KINDS,
+  type RedactionMap,
+} from "../privacy/redaction.ts";
+import { restorePlaceholders } from "../privacy/placeholderRestore.ts";
+import { resolveOrCreateEntity } from "../entities/entityIdentity.ts";
 import {
   assertSendable,
   buildRunManifest,
@@ -53,9 +72,11 @@ import {
   ContractSchemaError,
   parseStructuredOutput,
   validateBusiness,
+  validateRelations,
   type BusinessValidationResult,
   type ExtractedEventTime,
   type StructuredOutput,
+  type ValidatedRelation,
 } from "./contract.ts";
 import {
   EVIDENCE_REPAIR_KIND,
@@ -64,14 +85,26 @@ import {
   type EvidenceFailure,
   type ExtractionPlan,
 } from "./evidence.ts";
+import { GraphEdgeEndpointError, GraphStore } from "../graph/store.ts";
 import { ConceptResolver, RESOLVER_VERSION } from "./resolver.ts";
 import type { TraceSession } from "./trace.ts";
 
 const DEFAULT_CONTRACTS: Contracts = loadContracts();
 
+/**
+ * 三轴的短标识（`ap|rm|sc`）。
+ *
+ * 只由封闭枚举成员拼成，所以可以安全进错误消息、日志与 Trace（指令 §11.2：那个位置
+ * 永不可能出现原文、词面或映射）。错误消息点名「在册的是什么」是这道闸门有用与否的关键——
+ * 只说「不一致」而不说当前值，调用方无从知道自己错在哪一半。
+ */
+function axesKey(axes: ThreeAxes): string {
+  return `${axes.analysisProvider}|${axes.redactionMode}|${axes.sendContentMode}`;
+}
+
 /** 版本串一旦改动就是新管线，而不是新常量：默认值与 `contract.ts`、M2-4 夹具同源。 */
-export const DEFAULT_PROMPT_VERSION = "m2-prompt-v1";
-export const DEFAULT_OUTPUT_SCHEMA_VERSION = "m2-output-v1";
+export const DEFAULT_PROMPT_VERSION = "m2-prompt-v2";
+export const DEFAULT_OUTPUT_SCHEMA_VERSION = "m2-output-v2";
 export const DEFAULT_VALIDATION_VERSION = "validation-v1";
 
 let savepointCounter = 0;
@@ -166,14 +199,20 @@ export class IngestStateError extends Error {
 
 /**
  * 裁决 3（M2-4 复审）：`ExtractionRequest.redactionMap` 是可选的，Provider 层无法表达
- * 「云端模式必带映射」。编排层在发起调用之前补这道门：缺映射即拒，一次请求都不发出、
- * 一行数据都不写。两个本地模式不受此门约束（本地不存在需要对齐的第二份文本）。
+ * 「发送脱敏文本必带映射」。编排层在发起调用之前补这道门：缺映射即拒，一次请求都不发出、
+ * 一行数据都不写。
+ *
+ * M6-0C 起判据换成 `send_content_mode === "redacted"`：不外发的路径不需要映射（没有第二份
+ * 文本要对齐），发**原文**的路径也不受此门约束——矩阵 #9 的定义就是不脱敏，要求映射反而是矛盾。
  */
 export class RedactionMapRequiredError extends Error {
   readonly recordRevisionId: string;
 
   constructor(recordRevisionId: string) {
-    super(`cloud_redacted 必须携带本次脱敏映射，否则证据无法回锚原文坐标（§7.6.1）：${recordRevisionId}`);
+    super(
+      "send_content_mode=redacted 必须携带本次脱敏映射，否则证据无法回锚原文坐标（§7.6.1）：" +
+        recordRevisionId,
+    );
     this.name = "RedactionMapRequiredError";
     this.recordRevisionId = recordRevisionId;
   }
@@ -191,6 +230,25 @@ export class RunNotAdoptableError extends Error {
   constructor(detail: string) {
     super(detail);
     this.name = "RunNotAdoptableError";
+  }
+}
+
+/**
+ * 重新分析的前置条件不成立（M8-D-8）：这一版本上已经有一份在途的解析（`queued` / `running`），
+ * 不再开第二单。路由映射 409 `state_conflict`。
+ *
+ * 消息只带 run id 与执行态：这两个都是库里的标识符与枚举值，重新分析被拒这件事不构成新的外发面，
+ * 因此这里**绝不**拼任何载荷文本或模型输出。
+ */
+export class ReanalysisInFlightError extends Error {
+  readonly runId: string;
+  readonly executionStatus: string;
+
+  constructor(runId: string, executionStatus: string) {
+    super(`该版本已有一次解析在途，重新分析被拒：${runId} (${executionStatus})`);
+    this.name = "ReanalysisInFlightError";
+    this.runId = runId;
+    this.executionStatus = executionStatus;
   }
 }
 
@@ -214,17 +272,33 @@ export interface RevisionContext {
   readonly revisionId: string;
   readonly rawText: string;
   readonly processingStatus: string;
+  /** 派生只读兼容字段，只用于对外展示与核对；判定读 `axes`（草案 §五）。 */
   readonly processingMode: ProcessingMode;
+  /** 记录级三轴（草案 §二）：本服务一切闸门的唯一判定源。 */
+  readonly axes: ThreeAxes;
 }
 
 export interface IngestInput {
   readonly recordRevisionId: string;
   /** 省略则取记录在册的 `processing_mode`；显式传入必须与之一致（见 `resolveMode`）。 */
   readonly processingMode?: ProcessingMode;
-  /** 实际准备发送的那份文本：`cloud_redacted` 必填（= 已确认的预览载荷），本地模式省略即原文。 */
+  /** 省略则取在册三轴；显式传入必须与之一致（见 `resolveAxes`）——隐私承诺不是调用参数。 */
+  readonly axes?: ThreeAxes;
+  /** 实际准备发送的那份文本：任何一次外发（`send_content_mode ≠ none`）必填且必须是用户确认过的那份；本地模式省略即原文。 */
   readonly payloadText?: string;
   readonly redactionMap?: RedactionMap;
   readonly signal?: AbortSignal;
+  /**
+   * 用户显式触发的重新分析（M8-D-4）：同一条管线上再开一单，键带尝试序号。
+   * 缺席或 false ⇒ 幂等键与既有行为逐字不变。
+   */
+  readonly reanalysis?: boolean;
+  /**
+   * Phase B（PD-1）：首次整理（该 revision 没有 current）成功后自动生效。
+   * 产品侧（op2 / reparse / reanalyze / 后台执行体）传 true；缺省 false 保留服务层原语语义，
+   * 便于测试与显式控制。已有 current 时无论传什么都仍落 candidate。
+   */
+  readonly autoAdoptFirstResult?: boolean;
 }
 
 /** `beginRun` 的产物：run 行已提交，尚未发起任何模型调用。 */
@@ -256,6 +330,20 @@ export interface IngestWriteCounts {
   readonly unrouted: number;
   /** 歧义或未命中的实体标签数（§3.13：由用户选择，本层绝不自动合并）。 */
   readonly unresolvedEntities: number;
+  /** 真写进 `graph_edge` 的关系条数（M7-2b / §3.5）。已存在的同三元组不算新写入（R5：一个字都不改）。 */
+  readonly relations: number;
+  /**
+   * 关系门（§3.4）作废的条数：类型不在六值内、两端同词、证据回锚不出、词面无逐字依据。
+   * 与下面三类的区别是**来源**——那三类到了写入面才被判，这一类连写入面都没进。
+   * 坏一条只丢那一条，所以这个数不等于 run 失败。
+   */
+  readonly relationDroppedByContract: number;
+  /** 关系端点解析歧义而丢弃的条数（§3.5 三类分开计数：诊断时「为什么没边」是三个不同的答案）。 */
+  readonly relationAmbiguous: number;
+  /** 关系端点未解析到在册实体、或词面不属于本条记录而丢弃的条数。 */
+  readonly relationUnmatched: number;
+  /** 关系端点仍是 `provisional` 而丢弃的条数（R3：实体不转正）。 */
+  readonly relationProvisional: number;
 }
 
 /** commitDerived 边写边累计需要可变面；对外交出的仍是上面的只读面。 */
@@ -283,10 +371,15 @@ export interface IngestResult {
   readonly runId: string;
   readonly idempotencyKey: string;
   readonly pipelineFingerprint: string;
+  /** 派生只读兼容字段（草案 §五）。 */
   readonly processingMode: ProcessingMode;
+  /** 本次实际按哪三轴装配（§七 断言 7：`cloud_raw` 与 `cloud_redacted` 必须可区分）。 */
+  readonly axes: ThreeAxes;
   readonly succeeded: boolean;
   readonly replayed: boolean;
   readonly recovered: boolean;
+  /** Phase B：首次整理（该 revision 没有 current）成功后自动生效；重跑/已有 current 时为 false。 */
+  readonly autoAdopted: boolean;
   readonly provider: string;
   readonly model: string;
   readonly callPath: ProviderCallPath;
@@ -346,12 +439,38 @@ export function emptyWrites(): IngestWriteCounts {
     deduplicated: 0,
     unrouted: 0,
     unresolvedEntities: 0,
+    relations: 0,
+    relationDroppedByContract: 0,
+    relationAmbiguous: 0,
+    relationUnmatched: 0,
+    relationProvisional: 0,
   };
 }
 
-/** 逻辑任务的唯一身份：同一 revision + 同一管线 = 同一任务（§7.1、K-03）。 */
-export function deriveIdempotencyKey(recordRevisionId: string, fingerprint: string): string {
-  return `idem_${recordRevisionId}_${fingerprint}`;
+/**
+ * 关系边 `evidence_reason` 的证据原文上限（准则 §3.5）。
+ * 原文本来就在 `record_revision.raw_text` 与 `entity_mention.evidence_text` 里，截断只是不让
+ * 一列变成第二份长文存储。
+ */
+const RELATION_EVIDENCE_MAX_CHARS = 200;
+
+/** `parse_run:<runId> rev:<revisionId> span:<start>-<end> evidence=<原文≤200 字>`（§3.5）。 */
+function relationEvidenceReason(runId: string, revisionId: string, relation: ValidatedRelation): string {
+  const span = `${relation.evidenceStart}-${relation.evidenceEnd}`;
+  return (
+    `parse_run:${runId} rev:${revisionId} span:${span} ` +
+    `evidence=${relation.evidenceText.slice(0, RELATION_EVIDENCE_MAX_CHARS)}`
+  );
+}
+
+/**
+ * 逻辑任务的唯一身份：同一 revision + 同一管线 = 同一任务（§7.1、K-03）。
+ * `attempt` 只在用户显式重新分析时 >1（M8-D-4）：第 1 单的键逐字保持旧形状，
+ * 之后的单才追加 `_a<attempt>` 后缀——否则既有幂等/重放面会换一个身份。
+ */
+export function deriveIdempotencyKey(recordRevisionId: string, fingerprint: string, attempt = 1): string {
+  const base = `idem_${recordRevisionId}_${fingerprint}`;
+  return attempt <= 1 ? base : `${base}_a${attempt}`;
 }
 
 /**
@@ -450,6 +569,106 @@ function planToWritePlan(plan: ExtractionPlan): WritePlan {
   };
 }
 
+// ── 占位符回填与本地实体登记（D-2/D-3/D-7，2026-11-05）────────────────
+
+interface EntityClaim {
+  readonly name: string;
+  readonly type: string;
+}
+
+interface EntityOccurrence extends EntityClaim {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** 把回稿里的占位符换回真名（`evidence` 不动）。字段集合即 D-7。 */
+function restoreOutputPlaceholders(
+  output: StructuredOutput,
+  map: RedactionMap,
+  rawText: string,
+): StructuredOutput {
+  const r = (text: string): string => restorePlaceholders(text, map, rawText);
+  // 云端看不到真实实体 ID，可能把占位符本身填进 `candidateConceptId`——带方括号
+  //（`[person_1_x]`）或不带（`person_1_x`）都可能出现（实测两种都见过）。
+  // 合法候选 ID 只可能是 `entity_` / `concept_` 前缀；其余形态一律不是可用 ID，回填后清空。
+  // 实体身份改由回填后的真名经解析器/本机登记确定。
+  const isRealCandidateId = (value: string): boolean =>
+    value.startsWith("entity_") || value.startsWith("concept_");
+  const id = (value: string | null): string | null =>
+    value === null || isRealCandidateId(value) ? value : null;
+  const label = <T extends { readonly labelSaid: string; readonly candidateConceptId: string | null }>(
+    entry: T,
+  ): T => ({ ...entry, labelSaid: r(entry.labelSaid), candidateConceptId: id(entry.candidateConceptId) });
+  return {
+    ...output,
+    title: r(output.title),
+    summary: r(output.summary),
+    episodes: output.episodes.map((episode) => ({ ...episode, summary: r(episode.summary) })),
+    thoughts: output.thoughts.map((thought) => ({ ...thought, text: r(thought.text) })),
+    emotions: output.emotions.map(label),
+    topics: output.topics.map(label),
+    entities: output.entities.map(label),
+    relations: output.relations.map((relation) => ({
+      ...relation,
+      srcLabel: r(relation.srcLabel),
+      dstLabel: r(relation.dstLabel),
+    })),
+  };
+}
+
+/**
+ * 从本机脱敏映射里抽出「要登记成实体」的语义 span。
+ * 只取 `source === "local_llm"` 且 kind ∈ 人/地/组织：`entity_memory` span 已有实体、rule span 是格式类。
+ */
+function localEntityClaims(
+  map: RedactionMap,
+  rawText: string,
+): { readonly claims: readonly EntityClaim[]; readonly occurrences: readonly EntityOccurrence[] } {
+  const seen = new Set<string>();
+  const claims: EntityClaim[] = [];
+  const occurrences: EntityOccurrence[] = [];
+  for (const span of map.spans) {
+    if (span.source !== "local_llm") continue;
+    if (!(SEMANTIC_REDACTION_KINDS as readonly string[]).includes(span.kind)) continue;
+    const name = rawText.slice(span.originalStart, span.originalEnd);
+    if (name.trim() === "") continue;
+    const key = `${span.kind}\u0000${name.normalize("NFC")}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      claims.push({ name, type: span.kind });
+    }
+    occurrences.push({ name, type: span.kind, start: span.originalStart, end: span.originalEnd });
+  }
+  return { claims, occurrences };
+}
+
+/**
+ * 云端没为某个本机实体出标签时，用本机 span 自己补一条 explicit 提及，
+ * 保证「人物与事物」里有这条实体时至少有一条真实出现记录。已被云端标签覆盖的词面不重复补。
+ */
+function syntheticEntityLabels(
+  occurrences: readonly EntityOccurrence[],
+  cloudEntities: readonly { readonly labelSaid: string }[],
+): CandidateLabelWrite[] {
+  const covered = new Set(cloudEntities.map((label) => label.labelSaid.normalize("NFC")));
+  const labels: CandidateLabelWrite[] = [];
+  for (const occurrence of occurrences) {
+    if (covered.has(occurrence.name.normalize("NFC"))) continue;
+    labels.push({
+      collection: "entities",
+      labelSaid: occurrence.name,
+      candidateConceptId: null,
+      basis: "explicit",
+      evidenceText: occurrence.name,
+      evidenceStart: occurrence.start,
+      evidenceEnd: occurrence.end,
+      route: "mention",
+      suggestionKind: null,
+    });
+  }
+  return labels;
+}
+
 export interface IngestServiceOptions {
   readonly db: Database;
   readonly adapter: ModelAdapter;
@@ -462,6 +681,11 @@ export interface IngestServiceOptions {
   readonly trace?: TraceSession;
   /** 云端授权闸门：本层在写任何行之前调用一次，Provider 在发送时刻再校一次（两道门不互替）。 */
   readonly grantCheck?: () => void;
+  /**
+   * `redaction_mode=local_llm` 档的状态读数（M9-4b）：装配层从 `facts.config` 算好后递进来，
+   * 本层与 Provider 都不读配置文件。省略即按「未配置」处理——那一档因此被拒，而不是被放行。
+   */
+  readonly localLlm?: LocalLlmStatus;
   readonly contracts?: Contracts;
 }
 
@@ -723,8 +947,11 @@ export class IngestService {
   private readonly contracts: Contracts;
   private readonly trace: TraceSession | undefined;
   private readonly grantCheck: (() => void) | undefined;
+  /** `local_llm` 档的状态读数；缺席即由 Provider 按「未配置」处理（fail-closed，不放行）。 */
+  private readonly localLlm: LocalLlmStatus | undefined;
   private readonly resolver: ConceptResolver;
   private readonly corrections: CorrectionService;
+  private readonly graph: GraphStore;
 
   constructor(options: IngestServiceOptions) {
     this.db = options.db;
@@ -738,8 +965,10 @@ export class IngestService {
     this.contracts = options.contracts ?? DEFAULT_CONTRACTS;
     this.trace = options.trace;
     this.grantCheck = options.grantCheck;
+    this.localLlm = options.localLlm;
     this.resolver = new ConceptResolver(options.db);
     this.corrections = new CorrectionService(options.db, { now: this.now });
+    this.graph = new GraphStore(options.db, { now: this.now });
   }
 
   // ── 读取面 ────────────────────────────────────────────────────────
@@ -755,6 +984,34 @@ export class IngestService {
     const row = this.db.prepare(`select ${RUN_COLUMNS} from parse_run where idempotency_key = ?`).get(key) as
       | ParseRunRow
       | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * 这一版本在同一条管线上已经开过几单（M8-D-4 的尝试序号来源）。
+   * 只按 (revision, fingerprint) 数行，不看 execution_status 也不看 result_state：
+   * 序号钉的是「这条管线为这个版本跑过几次」，失败与遗留的单据同样占一个号。
+   */
+  private countRunsForRevision(revisionId: string, fingerprint: string): number {
+    const row = this.db
+      .prepare("select count(*) as n from parse_run where source_revision_id = ? and pipeline_fingerprint = ?")
+      .get(revisionId, fingerprint) as { n: number };
+    return row.n;
+  }
+
+  /**
+   * 这一版本名下有没有还在飞的解析（M8-D-8 的前置查询）：`queued` / `running` 都算在途。
+   * 按 revision 查而不是按 (revision, 指纹) 查——一次只让一份工作在飞，换管线也不例外。
+   * 按 rowid 取最早的一条，报出来的才是「挡路的那一单」。
+   */
+  private findInFlightRun(revisionId: string): { id: string; execution_status: string } | null {
+    const row = this.db
+      .prepare(
+        `select id, execution_status from parse_run
+           where source_revision_id = ? and execution_status in ('queued', 'running')
+           order by rowid limit 1`,
+      )
+      .get(revisionId) as { id: string; execution_status: string } | undefined;
     return row ?? null;
   }
 
@@ -1074,6 +1331,9 @@ export class IngestService {
       .prepare(
         `select cr.id as record_id, cr.current_revision_id as current_revision_id,
                 cr.processing_status as processing_status, cr.processing_mode as processing_mode,
+                cr.analysis_provider as analysis_provider,
+                cr.redaction_mode as redaction_mode,
+                cr.send_content_mode as send_content_mode,
                 rr.raw_text as raw_text
            from record_revision as rr
            join capture_record as cr on cr.id = rr.record_id
@@ -1085,6 +1345,9 @@ export class IngestService {
           current_revision_id: string;
           processing_status: string;
           processing_mode: string;
+          analysis_provider: string;
+          redaction_mode: string;
+          send_content_mode: string;
           raw_text: string;
         }
       | undefined;
@@ -1095,12 +1358,17 @@ export class IngestService {
     if (!(this.contracts.enums.processing_modes as readonly string[]).includes(row.processing_mode)) {
       throw new IngestInputError(`记录在册的 processing_mode 不在封闭集内：${row.processing_mode}`);
     }
+    // 三轴是判定源（草案 §二）：取值不在册即拒，不兜底成保守组合——兜底等于替用户改写隐私承诺。
+    // 组合合法性（§三 矩阵）在这里就过一遍，装配层因此拿不到一个不合法的 axes。
+    const axes = coerceAxes(row.analysis_provider, row.redaction_mode, row.send_content_mode);
+    assertThreeAxes(axes);
     return {
       recordId: row.record_id,
       revisionId,
       rawText: row.raw_text,
       processingStatus: row.processing_status,
       processingMode: row.processing_mode as ProcessingMode,
+      axes,
     };
   }
 
@@ -1118,32 +1386,69 @@ export class IngestService {
     return requested;
   }
 
+  /** `resolveMode` 的同一条纪律，落在真正的判定源上：显式传入的三轴只允许**核对**在册值。 */
+  private resolveAxes(ctx: RevisionContext, requested?: ThreeAxes): ThreeAxes {
+    if (requested === undefined) return ctx.axes;
+    if (axesKey(requested) !== axesKey(ctx.axes)) {
+      throw new IngestInputError(
+        `三轴属于记录在册的用户设置（当前 ${axesKey(ctx.axes)}），不得由解析调用改成 ${axesKey(requested)}`,
+      );
+    }
+    return requested;
+  }
+
   /**
-   * 发起调用前的门序：模式合法性 → 云端必带映射与载荷 → 本次授权。
+   * 发起调用前的门序：三轴组合与占位取值 → 外发必带映射与载荷 → 本次授权。
    * 「不该发」必须在物理上是零次调用、零行写入，所以这些门全部在建 run 行之前。
+   *
+   * 判据是 `send_content_mode`，不是 `processing_mode` 字面量（草案 §五 `egress_gate`）：
+   * `raw` 与 `redacted` 都离开本机，都要载荷、都要授权；只有「映射必带」是 `redacted` 独有的，
+   * 因为 `raw` 的定义就是不脱敏（矩阵 #9）。
    */
   private preCallGates(ctx: RevisionContext, request: ExtractionRequest, redactionMap: RedactionMap | undefined): void {
-    assertSendable(request, this.adapter);
-    if (request.processingMode !== "cloud_redacted") return;
-    if (redactionMap === undefined) throw new RedactionMapRequiredError(ctx.revisionId);
+    assertSendable(request, this.adapter, this.localLlm);
+    if (!isEgress(request.axes)) return;
+    if (request.axes.sendContentMode === "redacted" && redactionMap === undefined) {
+      throw new RedactionMapRequiredError(ctx.revisionId);
+    }
     if (request.payloadText === "") {
-      throw new IngestInputError(`cloud_redacted 的待发送载荷不能是空串：${ctx.revisionId}`);
+      throw new IngestInputError(
+        `send_content_mode=${request.axes.sendContentMode} 的待发送载荷不能是空串：${ctx.revisionId}`,
+      );
     }
     if (this.grantCheck === undefined) {
-      throw new IngestInputError(`cloud_redacted 必须注入本次授权闸门（指令 §7.3）：${ctx.revisionId}`);
+      throw new IngestInputError(
+        `send_content_mode=${request.axes.sendContentMode} 必须注入本次授权闸门（指令 §7.3）：${ctx.revisionId}`,
+      );
     }
     this.grantCheck();
   }
 
-  private buildRequest(ctx: RevisionContext, mode: ProcessingMode, input: IngestInput): ExtractionRequest {
+  private buildRequest(ctx: RevisionContext, mode: ProcessingMode, axes: ThreeAxes, input: IngestInput): ExtractionRequest {
     const redactionMap = input.redactionMap;
-    const isCloud = mode === "cloud_redacted";
-    if (isCloud && input.payloadText === undefined) {
-      throw new IngestInputError(`cloud_redacted 的载荷必须是用户确认过的那份文本（§5.1 第 3 步）：${ctx.revisionId}`);
+    // 派生列与三轴必须同源（0008 的表级 CHECK 已在库里钉住，这里是内存侧的同一道对账）：
+    // 不一致意味着有人绕过了写入路径，此时不能继续装配一个「谁都不知道发的是什么的」请求。
+    if (deriveProcessingMode(axes) !== mode) {
+      throw new IngestInputError(
+        `processing_mode=${mode} 与三轴 ${axesKey(axes)} 的派生结果不一致：拒绝装配（草案 §五）`,
+      );
     }
-    const payloadText = isCloud ? (input.payloadText as string) : (input.payloadText ?? ctx.rawText);
+    if (isEgress(axes) && input.payloadText === undefined) {
+      throw new IngestInputError(
+        `send_content_mode=${axes.sendContentMode} 的载荷必须是用户确认过的那份文本（§5.1 第 3 步）：${ctx.revisionId}`,
+      );
+    }
+    // `raw` 发送的**必须**是这条记录自己的原文：客户端传了别的文本就等于拿「已授权发原文」
+    // 的授权去发一份没被确认过的内容，那正是授权绑定要防的事。
+    if (axes.sendContentMode === "raw" && input.payloadText !== undefined && input.payloadText !== ctx.rawText) {
+      throw new IngestInputError(`raw 的载荷只能是该版本自己的原文（§三 矩阵 #9）：${ctx.revisionId}`);
+    }
+    // 上面两道门已经把「外发必须有确认过的载荷」钉死了，这里剩下的只是取那一份文本；
+    // 不外发（本地/仅保存）时省略载荷照旧回落原文——那是 M2 以来的既有行为。
+    const payloadText = input.payloadText ?? ctx.rawText;
     return {
       recordRevisionId: ctx.revisionId,
+      axes,
       processingMode: mode,
       payloadText,
       systemPrompt: this.systemPrompt,
@@ -1167,7 +1472,8 @@ export class IngestService {
   beginRun(input: IngestInput): RunHandle {
     const ctx = this.revisionContext(input.recordRevisionId);
     const mode = this.resolveMode(ctx, input.processingMode);
-    const request = this.buildRequest(ctx, mode, input);
+    const axes = this.resolveAxes(ctx, input.axes);
+    const request = this.buildRequest(ctx, mode, axes, input);
     this.preCallGates(ctx, request, input.redactionMap);
 
     const manifest = buildRunManifest({
@@ -1183,7 +1489,24 @@ export class IngestService {
       redactionMap: input.redactionMap === undefined ? null : redactionMapJsonValue(input.redactionMap),
     });
     const fingerprint = pipelineFingerprint(manifest);
-    const idempotencyKey = deriveIdempotencyKey(ctx.revisionId, fingerprint);
+    // M8-D-8：显式重新分析先看在途。单进程内 beginRun 全同步——这次查询与下面的插入落在同一个 tick，
+    // 中间不 await，因此不需要（也不该有）UNIQUE 冲突捕获那一层兜底。
+    if (input.reanalysis === true) {
+      const inFlight = this.findInFlightRun(ctx.revisionId);
+      if (inFlight !== null) throw new ReanalysisInFlightError(inFlight.id, inFlight.execution_status);
+    }
+    // M8-D-4：尝试序号 = 1 + 这一版本同一条管线上已有的 run 行数，且**只有**显式重新分析才启用。
+    // 缺席时序号恒为 1 ⇒ 键与既有形状逐字相同（既有幂等/重放面不受本次改动影响）。
+    let attempt = input.reanalysis === true ? 1 + this.countRunsForRevision(ctx.revisionId, fingerprint) : 1;
+    let idempotencyKey = deriveIdempotencyKey(ctx.revisionId, fingerprint, attempt);
+    // Phase B（PD-1）：superseded 是终态，重放它只会得到一份永远不可见的「成功」。
+    // 撤销/放弃之后用户再点整理，应沿同一管线顺延开新一单，而不是把旧行原样喂回来。
+    if (input.reanalysis !== true) {
+      while (this.findRunByIdempotencyKey(idempotencyKey)?.result_state === "superseded") {
+        attempt += 1;
+        idempotencyKey = deriveIdempotencyKey(ctx.revisionId, fingerprint, attempt);
+      }
+    }
     const ts = this.now().toISOString();
 
     return inTransaction(this.db, () => {
@@ -1349,7 +1672,10 @@ export class IngestService {
         this.adapter,
         run.request,
         this.transport,
-        this.grantCheck === undefined ? {} : { requireGrant: this.grantCheck },
+        {
+          ...(this.grantCheck === undefined ? {} : { requireGrant: this.grantCheck }),
+          ...(this.localLlm === undefined ? {} : { localLlm: this.localLlm }),
+        },
       );
     } catch (cause) {
       const failure = this.classify(cause);
@@ -1357,9 +1683,9 @@ export class IngestService {
       return this.resultFromFailure(run, failure);
     }
 
-    let output: StructuredOutput;
+    let parsed: StructuredOutput;
     try {
-      output = parseStructuredOutput(outcome.json);
+      parsed = parseStructuredOutput(outcome.json);
     } catch (cause) {
       const failure = this.classify(cause);
       this.failRun(run, failure);
@@ -1377,10 +1703,18 @@ export class IngestService {
       });
     }
 
+    // D-7：先把回稿里的占位符换回真名，再进校验与写库；evidence 不在此列（证据锚定仍在脱敏坐标）。
+    const redactionMap =
+      run.request.redactionMap === undefined ? undefined : parseRedactionMap(run.request.redactionMap);
+    const output: StructuredOutput =
+      redactionMap === undefined ? parsed : restoreOutputPlaceholders(parsed, redactionMap, run.context.rawText);
+    // D-2/D-3：本机脱敏识别出的语义实体，稍后在写库事务里登记。
+    const local = redactionMap === undefined ? { claims: [], occurrences: [] } : localEntityClaims(redactionMap, run.context.rawText);
+
     const context = {
       sentText: run.request.payloadText,
       rawText: run.context.rawText,
-      ...(run.request.redactionMap === undefined ? {} : { redactionMap: parseRedactionMap(run.request.redactionMap) }),
+      ...(redactionMap === undefined ? {} : { redactionMap }),
       knownConcepts: this.resolver.knownConcepts(),
       knownEntityIds: this.resolver.knownEntityIds(),
     };
@@ -1414,11 +1748,24 @@ export class IngestService {
       whollyFailed = split.whollyFailed;
     }
 
+    // D-2/D-3：本机识别、云端没出标签的实体，用 span 自身的真实出现补一条 explicit 提及。
+    if (local.occurrences.length > 0) {
+      plan = { ...plan, labels: [...plan.labels, ...syntheticEntityLabels(local.occurrences, output.entities)] };
+    }
+
+    // 关系门（§3.4）与致命门共用判据，但**去向不同**：坏一条只丢那一条，run 照旧成功。
+    // 所以它不进 `issues.throwIfAny()`，只把通过的那部分交给写入面（§3.5）。
+    const relationGate = validateRelations(output, context);
+
     const committed = this.commitDerived(run, plan, {
       whollyFailed,
       repairs,
       aiTitle: output.title,
       aiSummary: output.summary,
+      relations: relationGate.relations,
+      relationsDiscarded: relationGate.discarded.length,
+      autoAdopt: input.autoAdoptFirstResult === true,
+      entityClaims: local.claims,
     });
     return this.resultFromOutcome(run, outcome, {
       succeeded: committed.errorKind === null,
@@ -1427,6 +1774,7 @@ export class IngestService {
       title: output.title,
       summary: output.summary,
       errorKind: committed.errorKind,
+      autoAdopted: committed.autoAdopted,
       ...(committed.errorKind === null
         ? {}
         : {
@@ -1458,18 +1806,43 @@ export class IngestService {
       /** Provider 产出的标题/摘要，来自 `StructuredOutput`；成功路径唯一落库处（§四-4）。 */
       readonly aiTitle: string;
       readonly aiSummary: string;
+      /** 过关系门的那几条（§3.4）；端点解析与落库在 §3.5，只走成功路径。 */
+      readonly relations: readonly ValidatedRelation[];
+      /** 关系门作废的条数（§3.4）：门在事务之前就跑完了，与这一笔事务成没成无关，故无条件记账。 */
+      readonly relationsDiscarded: number;
+      /** Phase B：首次整理自动生效（PD-1）。产品侧传 true；服务层缺省 false。 */
+      readonly autoAdopt: boolean;
+      /** 本机脱敏识别出、要登记成实体的语义词面（D-2/D-3）。 */
+      readonly entityClaims: readonly EntityClaim[];
     },
   ): {
     readonly writes: IngestWriteCounts;
     readonly collisions: readonly SuggestionCollision[];
     readonly errorKind: ParseErrorKind | null;
     readonly issues: readonly string[];
+    readonly autoAdopted: boolean;
   } {
     return inTransaction(this.db, () => {
       const writes: MutableIngestWriteCounts = emptyWrites();
       const collisions: SuggestionCollision[] = [];
+      let autoAdopted = false;
       const ts = this.now().toISOString();
       const revisionId = run.context.revisionId;
+      // 关系门的丢弃条数不是这一笔事务的产物：门在事务之前就跑完了，整批证据失败那次同样记。
+      writes.relationDroppedByContract = input.relationsDiscarded;
+
+      // D-1/D-2/D-3：先登记本机识别出的实体（事务内，失败随本批一起回滚）。
+      // 已存在则复用，绝不在复用路径上改词面/类型。
+      for (const claim of input.entityClaims) {
+        resolveOrCreateEntity(this.db, {
+          name: claim.name,
+          type: claim.type,
+          originType: "ai_generated",
+          lifecycleStatus: "active",
+          privacyLevel: "normal",
+          now: ts,
+        });
+      }
 
       writes.episodes = this.writeEpisodes(run.runId, revisionId, plan.episodes, ts);
       writes.thoughts = this.writeThoughts(run.runId, revisionId, plan.thoughts, ts);
@@ -1499,6 +1872,18 @@ export class IngestService {
       const errorKind: ParseErrorKind | null = input.whollyFailed ? "evidence_unmapped" : null;
 
       if (errorKind === null) {
+        // 关系边写在 run 转 succeeded **之前**：一条边的端点不合写入面（§3.5）就该整事务回滚，
+        // 于是库里留下的是「running 的 run + 零关系边」这种可恢复形态，而不是 succeeded + 半套边。
+        // 全批证据失败（errorKind 非 null）时不写：那次 run 连 Mention 都没落成，边更无从谈起。
+        const recordEntityLabels = new Set<string>(
+          plan.labels.filter((label) => label.collection === "entities").map((label) => label.labelSaid.normalize("NFC")),
+        );
+        const relationWrites = this.writeRelations(run.runId, revisionId, input.relations, ts, recordEntityLabels);
+        writes.relations = relationWrites.relations;
+        writes.relationAmbiguous = relationWrites.ambiguous;
+        writes.relationUnmatched = relationWrites.unmatched;
+        writes.relationProvisional = relationWrites.provisional;
+
         // §3.7 / M2 验收报告 §四-4：AI 标题/摘要的唯一落库处（0007 的两列）。
         // 候选 run 也写——「那次解析说了什么」与 result_state 无关，采纳前的候选同样要能事后取回。
         // 失败与回放路径都不走到这里，库里维持 0007 的 DEFAULT ''：空串 = 「这次没落过」，不拿猜测值冒充。
@@ -1509,6 +1894,15 @@ export class IngestService {
         const status = this.recordStatus(run.context.recordId);
         assertStateTransition("processing_status", status, "parsed", this.contracts.enums);
         this.db.prepare(`update capture_record set processing_status = 'parsed' where id = ?`).run(run.context.recordId);
+        // Phase B（PD-1）：该 revision 还没有任何 current 结果 ⇒ 首次整理自动生效，盒子那几页立刻看得见。
+        // 已有 current（重跑 / 重新分析）仍落 candidate，由用户比较后自己采纳。
+        const hasCurrent = this.db
+          .prepare(`select 1 as hit from parse_run where source_revision_id = ? and result_state = 'current' limit 1`)
+          .get(revisionId);
+        if (input.autoAdopt && hasCurrent === undefined) {
+          this.moveResultState(run.runId, "candidate", "current");
+          autoAdopted = true;
+        }
       } else {
         this.moveRun(run.runId, "running", "failed", { errorKind, finishedAtUtc: ts });
         const status = this.recordStatus(run.context.recordId);
@@ -1516,7 +1910,7 @@ export class IngestService {
         this.db.prepare(`update capture_record set processing_status = 'failed' where id = ?`).run(run.context.recordId);
       }
 
-      return { writes, collisions, errorKind, issues };
+      return { writes, collisions, errorKind, issues, autoAdopted };
     });
   }
 
@@ -1687,6 +2081,100 @@ export class IngestService {
     }
 
     return { mentions, rejected, suggestions, deduplicated, unrouted, unresolvedEntities };
+  }
+
+  /**
+   * 关系 → 端点解析 → `graph_edge`（准则 §3.5，M7-2b 的写入面）。
+   *
+   * 三条口径与判据顺序：
+   *  1. **词面必须属于本条记录**（`recordEntityLabels` = 本次 output 抽出的 entities 词面集）：
+   *     不在集内按 `unmatched` 计——它压根不是「这条记录里的人和物」。
+   *  2. `resolveEntity` 的 `ambiguous` / `unmatched` 各归各的计数（§3.13 的同一取向：多于一个候选
+   *     是用户的事，本层绝不猜）。两端解析到**同一个实体**也归 `ambiguous`：那不构成两个实体间的关系。
+   *  3. 端点实体 `lifecycle_status` 非 `active` ⇒ 归 `provisional` 计数，**实体不转正**（R3）。
+   *
+   * 方向归一与 `(relation_type, src_id, dst_id)` 命中既有行**都归 `GraphStore`**（R5/R6），
+   * 这里不再做一次。store 抛 `GraphEdgeEndpointError` 时按它的 `reason` 记账（`missing` ⇒
+   * unmatched、`not_active` ⇒ provisional）而不是吞掉：这一层唯一的取信来源是它。
+   * `GraphEdgeInputError`（类型不在册、端点为空等）照抛——那是上游契约被违反，不是某一条关系坏。
+   */
+  private writeRelations(
+    runId: string,
+    revisionId: string,
+    relations: readonly ValidatedRelation[],
+    ts: string,
+    recordEntityLabels: ReadonlySet<string>,
+  ): {
+    readonly relations: number;
+    readonly ambiguous: number;
+    readonly unmatched: number;
+    readonly provisional: number;
+  } {
+    let written = 0;
+    let ambiguous = 0;
+    let unmatched = 0;
+    let provisional = 0;
+
+    for (const relation of relations) {
+      const srcTerm = relation.srcLabel.normalize("NFC");
+      const dstTerm = relation.dstLabel.normalize("NFC");
+      if (!recordEntityLabels.has(srcTerm) || !recordEntityLabels.has(dstTerm)) {
+        unmatched += 1;
+        continue;
+      }
+      const src = this.resolver.resolveEntity(srcTerm);
+      const dst = this.resolver.resolveEntity(dstTerm);
+      if (src.kind === "ambiguous" || dst.kind === "ambiguous") {
+        ambiguous += 1;
+        continue;
+      }
+      if (src.kind !== "resolved" || dst.kind !== "resolved") {
+        unmatched += 1;
+        continue;
+      }
+      if (src.entityId === dst.entityId) {
+        ambiguous += 1;
+        continue;
+      }
+      if (!this.isActiveEntity(src.entityId) || !this.isActiveEntity(dst.entityId)) {
+        provisional += 1;
+        continue;
+      }
+      try {
+        const inserted = this.graph.insertEdgeIfAbsent({
+          relationType: relation.relationType,
+          srcEntityId: src.entityId,
+          dstEntityId: dst.entityId,
+          createdBy: "ai_generated",
+          originParseRunId: runId,
+          evidenceReason: relationEvidenceReason(runId, revisionId, relation),
+          now: new Date(ts),
+        });
+        // `created === false` 是同三元组已有行（R5：一个字都不改），不是本 run 新写的边。
+        if (inserted.created) written += 1;
+      } catch (cause) {
+        if (cause instanceof GraphEdgeEndpointError) {
+          if (cause.reason === "missing") unmatched += 1;
+          else provisional += 1;
+          continue;
+        }
+        throw cause;
+      }
+    }
+
+    return { relations: written, ambiguous, unmatched, provisional };
+  }
+
+  /**
+   * 端点实体的 active 判定（R3 的写入侧一半）。`resolveEntity` 的候选集含 `provisional`
+   * （§3.1：Mention 可以挂在 Provisional Entity 上），所以「解析得到」不等于「可以进图」；
+   * store 也会守一次，但那一守发生在**它的**取值门之后，本层的计数得在这里分得开。
+   */
+  private isActiveEntity(entityId: string): boolean {
+    const row = this.db
+      .prepare(`select lifecycle_status as s from entity where id = ?`)
+      .get(entityId) as { s: string } | undefined;
+    return row?.s === "active";
   }
 
   private insertSuggestion(input: {
@@ -1902,6 +2390,28 @@ export class IngestService {
     });
   }
 
+  /**
+   * Phase B（PD-1）：撤销一次已生效的结果。
+   *
+   * 只接受 `succeeded + current`；把 current→superseded 并把这一 run 的派生行一起转 superseded。
+   * 撤销后该 revision 没有 current 结果，盒子那几页看不见它；再想看就重新发起整理（会落一份新结果）。
+   * 历史行不删（与采纳/放弃同一口径）。
+   */
+  undoCurrent(runId: string): void {
+    const run = this.readRun(runId);
+    if (run === null) throw new RunNotFoundError(runId);
+    if (run.execution_status !== "succeeded") {
+      throw new RunNotAdoptableError(`只有执行成功的 run 才能撤销：当前 ${run.execution_status}`);
+    }
+    if (run.result_state !== "current") {
+      throw new RunNotAdoptableError(`只有 current 结果可以撤销：当前 ${run.result_state}`);
+    }
+    inTransaction(this.db, () => {
+      this.moveResultState(runId, "current", "superseded");
+      this.supersedeDerivedRows(runId);
+    });
+  }
+
   // ── Trace 与结果组装 ──────────────────────────────────────────────
 
   private recordTrace(
@@ -1928,6 +2438,9 @@ export class IngestService {
       parseRunId: run.runId,
       idempotencyKey: run.idempotencyKey,
       pipelineFingerprint: run.pipelineFingerprint,
+      analysisProvider: run.request.axes.analysisProvider,
+      redactionMode: run.request.axes.redactionMode,
+      sendContentMode: run.request.axes.sendContentMode,
       processingMode: run.processingMode,
       provider: this.adapter.provider,
       model: this.adapter.model,
@@ -2006,6 +2519,8 @@ export class IngestService {
       readonly errorKind: ParseErrorKind | null;
       readonly businessPassed: boolean;
       readonly derivedWriteCommitted: boolean;
+      /** Phase B：首次整理自动生效（PD-1）。 */
+      readonly autoAdopted?: boolean;
       /** 形状门（Zod）是否放行——降级只解决「拿不回信封」，不保证结构成立。 */
       readonly structuredParseSucceeded?: boolean;
       readonly failure?: IngestFailure;
@@ -2026,6 +2541,7 @@ export class IngestService {
     });
     return this.buildResult(run, {
       succeeded: input.succeeded,
+      autoAdopted: input.autoAdopted ?? false,
       callPath: outcome.callPath,
       attemptedPaths: outcome.attemptedPaths,
       degraded: outcome.degraded,
@@ -2043,6 +2559,7 @@ export class IngestService {
     input: {
       readonly succeeded: boolean;
       readonly replayed?: boolean;
+      readonly autoAdopted?: boolean;
       readonly callPath: ProviderCallPath;
       readonly attemptedPaths: readonly ProviderCallPath[];
       readonly degraded: boolean;
@@ -2066,14 +2583,25 @@ export class IngestService {
         derivedWriteCommitted: false,
       });
     }
+    // 重放没有经过 commitDerived；它的「是否已生效」要现读那一行的 result_state，
+    // 否则界面会把一份 current 结果说成「候选」。
+    const autoAdopted =
+      input.autoAdopted ??
+      (input.replayed === true
+        ? (this.db.prepare(`select result_state as s from parse_run where id = ?`).get(run.runId) as
+            | { s: string }
+            | undefined)?.s === "current"
+        : false);
     return {
       runId: run.runId,
       idempotencyKey: run.idempotencyKey,
       pipelineFingerprint: run.pipelineFingerprint,
+      axes: run.request.axes,
       processingMode: run.processingMode,
       succeeded: input.succeeded,
       replayed: input.replayed ?? false,
       recovered: run.recovered,
+      autoAdopted,
       provider: this.adapter.provider,
       model: this.adapter.model,
       callPath: input.callPath,

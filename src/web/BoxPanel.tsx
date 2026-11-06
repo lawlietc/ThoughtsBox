@@ -419,7 +419,6 @@ export function BoxPanel(props: BoxPanelProps): React.ReactNode {
             <div className="box-page-head">
               <div>
                 <h2>{shape.title}</h2>
-                <p className="hint">{shape.lede}</p>
               </div>
               {canChooseDisplay && (
                 <div className="box-view-switch" role="group" aria-label="显示方式">

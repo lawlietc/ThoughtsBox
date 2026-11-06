@@ -33,7 +33,7 @@ export type ThemeName = "light" | "dark";
 /**
  * 页面标识。归属哪个主 tab 由 `nav.ts` 的 `tabOf()` 算，不另存一份状态。
  *
- * - `quick` / `sleep` 是**动作**，不是可以逛的地方，不在任何标签栏里。
+ * - `quick` / `sleep` / `edit` 是**动作**，不是可以逛的地方，不在任何标签栏里。
  * - `overview` 是沟通件自己的目录页，产品里没有这个入口。
  * - `graph` 整个功能按裁定推迟，先挂着不给入口。
  */
@@ -45,6 +45,8 @@ export type ViewKey =
   | "ingest"
   | "suggestions"
   | "sleep"
+  // 编辑原文：写是独占动作，进 STANDALONE（不进标签栏、自带返回）
+  | "edit"
   // 盒子 tab（顶部子 tab，搜索收在这里）
   | "emotions"
   | "episodes"
@@ -178,6 +180,39 @@ export interface StatusLineProps {
   readonly children: ReactNode;
 }
 
+/* ── 统一反馈面（web-redesign 批 2 · 事项 I）───────────────────── */
+
+/**
+ * 提示的类别。`ok` = 刚做成一件事，会自己消失；`error` = 做失败了，必须留下并带下一步；
+ * `status` = 长期状态（后端不可达那一类），既不消失也不该占着错误的位置。
+ */
+export type NoticeTone = "ok" | "error" | "status";
+
+/** 错误必须带下一步：一个按钮，位置就在这条提示里。 */
+export interface NoticeAction {
+  readonly label: string;
+  readonly onClick: () => void;
+}
+
+export interface NoticeItem {
+  readonly id: string;
+  readonly tone: NoticeTone;
+  /** 主体文案。服务端原文逐字进这里，界面无权改写。 */
+  readonly message: string;
+  readonly action?: NoticeAction;
+  /** 按需技术值：折叠件内容，主界面不显示。 */
+  readonly rows?: readonly (readonly [string, string])[];
+  /** 绑记录：切到别的记录时清掉这一条。 */
+  readonly scope?: string;
+  /** `status` 类的去重把手：同一个 key 只保留最新一条。 */
+  readonly key?: string;
+}
+
+export interface NoticeBarProps {
+  readonly notices: readonly NoticeItem[];
+  readonly onDismiss: (id: string) => void;
+}
+
 export interface ShellProps {
   /** 当前页。tab 高亮与子 tab 由它算出来，不另存。 */
   readonly view: ViewKey;
@@ -186,10 +221,18 @@ export interface ShellProps {
   readonly onNavigate: (view: ViewKey) => void;
   /** 子 tab 上的计数（待整理 / 待确认）。没有计数的页不传。 */
   readonly badges?: Partial<Record<ViewKey, number>>;
-  /** 一次性提示文案（`**加粗**` 由 `Prose` 渲染）。 */
-  readonly notice?: string | null;
+  /** 统一反馈面：全局唯一的提示位（外壳画在滚动区之外）。 */
+  readonly notices?: readonly NoticeItem[];
+  /** 关掉某一条。`status` 类由调用方决定何时撤，其余由用户点关闭。 */
+  readonly onDismissNotice?: (id: string) => void;
   readonly title: string;
   readonly lede?: string;
+  /**
+   * STANDALONE 页那条「← 返回」去哪、叫什么。
+   * 默认回「今天」；编辑页例外——它得回到**那一条记录**，回首页等于把用户刚编的那条丢了。
+   */
+  readonly backTo?: ViewKey;
+  readonly backLabel?: string;
   /** 标题栏右侧的入口。产品不传 —— 沟通件自己的目录页入口属于那一侧。 */
   readonly headerAside?: ReactNode;
   /** 整屏顶部的横幅（「这份模拟数据在骗你」那一类）。产品不传。 */

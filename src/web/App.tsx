@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { api, type Health } from "./apiClient.ts";
@@ -8,6 +8,7 @@ import { IngestPanel } from "./IngestPanel.tsx";
 import { boxShapeOf } from "./projectionPort.ts";
 import { useProductDataPort } from "./productPort.ts";
 import { QuickPanel } from "./QuickPanel.tsx";
+import { RecordEditPanel } from "./RecordEditPanel.tsx";
 import { RecordsPanel } from "./RecordsPanel.tsx";
 import { SearchPanel } from "./SearchPanel.tsx";
 import { SettingsPanel } from "./SettingsPanel.tsx";
@@ -15,6 +16,7 @@ import { SleepPanel } from "./SleepPanel.tsx";
 import { SuggestionsPanel } from "./SuggestionsPanel.tsx";
 import { TodayPanel } from "./TodayPanel.tsx";
 import { Shell } from "./ui/Shell.tsx";
+import { useNotices } from "./useNotices.ts";
 import { useIsNarrow } from "./ui/bits.tsx";
 import type { DataPort } from "./projectionPort.ts";
 import type { ViewKey } from "./ui/types.ts";
@@ -48,6 +50,9 @@ import type { ViewKey } from "./ui/types.ts";
  */
 const DEFERRED_VIEWS: readonly ViewKey[] = ["graph"];
 
+/** 「后端不可达」这条长期状态的 key/scope：同一个数既用于去重，也用于恢复时撤掉。 */
+const BACKEND_DOWN_SCOPE = "backend-down";
+
 /** 窄屏标题栏只回答「现在在哪」，不再重复产品名和品牌副标题。 */
 function pageTitle(view: ViewKey, detailOpen: boolean): string {
   if (view === "records" && detailOpen) return "记录详情";
@@ -66,6 +71,8 @@ function pageTitle(view: ViewKey, detailOpen: boolean): string {
       return "待确认";
     case "sleep":
       return "睡前收尾";
+    case "edit":
+      return "编辑原文";
     case "search":
       return "搜索";
     case "more":
@@ -100,9 +107,7 @@ function MorePage(props: {
 
       <section className="card">
         <h3>关于</h3>
-        <p className="hint">
-          思绪盒子 · 先把自己写下来，再慢慢看清。记录不会离开这台电脑，除非你在某一条上明确同意发送。
-        </p>
+        <p className="hint">记录不会离开这台电脑，除非你在某一条上明确同意发送。</p>
       </section>
     </div>
   );
@@ -128,6 +133,7 @@ export function App(props: AppProps): React.ReactNode {
   const product = useProductDataPort(props.port === undefined);
   const port = props.port ?? product.port;
   const narrow = useIsNarrow();
+  const { notices, push, dismiss, clearScope } = useNotices();
   // 裁定的开机第一屏就是「今天」（UI-3 已把这一页接上真实 RecordRow 列表）。
   const [view, setView] = useState<ViewKey>("today");
   const [health, setHealth] = useState<Health | null>(null);
@@ -135,6 +141,58 @@ export function App(props: AppProps): React.ReactNode {
   const [pendingCount, setPendingCount] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const detailOpen = narrow && view === "records" && selectedId !== null;
+
+  /**
+   * 离开一页之前的守卫（〔web-redesign 批 4 · C〕）。
+   *
+   * 编辑页有未保存的草稿时，**返回与三个 tab 都得先问它** —— 这两样都是外壳画的，
+   * 页面自己拦不到。所以守卫住在这里：页面挂一个「去下一页走不走得掉」的判据，
+   * 外壳的每一次跳转都过它。返回 `false` 时页面把自己的「留下改动 / 丢弃」二选摆出来，跳转不发生。
+   *
+   * 判据收下**目的地**：用户点的是「盒子」tab，那么选「丢弃」之后要去的也是盒子，
+   * 不是固定回到进来时那一页 —— 拦下来的目的只是问一句，不是替他改主意。
+   */
+  const leaveGuard = useRef<((next: ViewKey) => boolean) | null>(null);
+  const registerLeaveGuard = useCallback((guard: ((next: ViewKey) => boolean) | null) => {
+    leaveGuard.current = guard;
+  }, []);
+  const navigate = useCallback((next: ViewKey) => {
+    const guard = leaveGuard.current;
+    if (guard !== null && !guard(next)) return;
+    setView(next);
+  }, []);
+  /** 用户已经明确表态（保存成功 / 丢弃改动）之后的跳转：不再问守卫，问就是自己跟自己打架。 */
+  const leaveWithoutGuard = useCallback((next: ViewKey) => {
+    leaveGuard.current = null;
+    setView(next);
+  }, []);
+
+  /**
+   * 编辑页从哪儿来。返回时回到**原来那一页**，不是固定回「全部记录」：
+   * 从「待整理」进编辑的人，回来该看见自己那一条的发送闸门，而不是被丢到另一页。
+   */
+  const [editFrom, setEditFrom] = useState<ViewKey>("records");
+  const openEdit = useCallback(() => {
+    setEditFrom(view);
+    navigate("edit");
+  }, [view, navigate]);
+
+  /**
+   * 「上一个不是写记录的页面」（整理方式改动 S-5）。
+   *
+   * 「保存并整理」成功后要回到来路那一页：写记录是今天的一个入口，也可能是从别处点进来的，
+   * 固定回「今天」会把从搜索进来的人丢在错误的页面上。入口分散在各页（没有统一的
+   * `openQuick`），所以来路不靠调用方报备，就在每次切页时把**上一个非 quick 的 view** 记下来——
+   * 与 `editFrom` 同一个意思，只是那边有唯一入口、这边没有。
+   */
+  const [quickReturn, setQuickReturn] = useState<ViewKey>("today");
+  useEffect(() => {
+    if (view !== "quick") setQuickReturn(view);
+  }, [view]);
+  /** 排进队列后离开写记录页：走 `leaveWithoutGuard`——这一页没有需要守卫的草稿，草稿守卫属于编辑页。 */
+  const returnFromQuick = useCallback(() => {
+    leaveWithoutGuard(quickReturn);
+  }, [leaveWithoutGuard, quickReturn]);
 
   const reload = useCallback(async () => {
     let online = false;
@@ -177,19 +235,37 @@ export function App(props: AppProps): React.ReactNode {
     void reload();
   }, [reload]);
 
-  const backendDownNotice = backendDown
-    ? "本地后端不可达。请先启动 npm run start:server（仅监听 127.0.0.1）。"
-    : null;
+  /**
+   * 「后端不可达」是一条**长期状态**，不是一次动作的回话（〔web-redesign 批 2 · 事项 I〕）：
+   * 进顶部提示位、不自动消失、按 key 去重（每轮重取都不叠成好几条），
+   * 恢复可达时随 scope 撤掉 —— 由不得页面自己「闪一下就过去」。
+   */
+  useEffect(() => {
+    if (!backendDown) {
+      clearScope(BACKEND_DOWN_SCOPE);
+      return;
+    }
+    push({
+      tone: "status",
+      key: BACKEND_DOWN_SCOPE,
+      scope: BACKEND_DOWN_SCOPE,
+      message: "本地后端不可达。请先启动 npm run start:server（仅监听 127.0.0.1）。",
+      action: { label: "重试连接", onClick: () => void reload() },
+    });
+  }, [backendDown, clearScope, push, reload]);
 
   return (
     <Shell
       view={view}
       detailOpen={detailOpen}
-      onNavigate={setView}
+      onNavigate={navigate}
       badges={pendingCount === null ? {} : { ingest: pendingCount }}
-      notice={backendDownNotice}
+      notices={notices}
+      onDismissNotice={dismiss}
       banner={props.banner}
       title={pageTitle(view, detailOpen)}
+      backTo={view === "edit" ? editFrom : "today"}
+      backLabel={view === "edit" ? "← 返回这条记录" : "← 返回今天"}
     >
       {/* 面板按 view 条件渲染 = 切页即重挂载，列表与详情永远反映服务端当前状态。 */}
       {view === "today" && (
@@ -207,10 +283,22 @@ export function App(props: AppProps): React.ReactNode {
           selectedId={selectedId}
           onSelect={setSelectedId}
           onBadgesChanged={refreshBadges}
+          notify={push}
+          clearScope={clearScope}
+          onGoPending={() => navigate("ingest")}
+          onEdit={openEdit}
         />
       )}
       {view === "ingest" && (
-        <IngestPanel selectedId={selectedId} onSelect={setSelectedId} onBadgesChanged={refreshBadges} />
+        <IngestPanel
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          onBadgesChanged={refreshBadges}
+          notify={push}
+          clearScope={clearScope}
+          onEdit={openEdit}
+          onOpenSettings={() => navigate("data")}
+        />
       )}
       {view === "suggestions" && <SuggestionsPanel port={port} />}
       {/* 盒子五页共用一份实现，页与页的差别全在 `projectionPort.ts` 的形状表里。 */}
@@ -238,9 +326,15 @@ export function App(props: AppProps): React.ReactNode {
       {view === "quick" && (
         <QuickPanel
           onSaved={refreshBadges}
+          notify={push}
+          onReturnToPrevious={returnFromQuick}
           onOpenPending={(recordId) => {
             setSelectedId(recordId);
             setView("ingest");
+          }}
+          onOpenRecord={(recordId) => {
+            setSelectedId(recordId);
+            setView("records");
           }}
         />
       )}
@@ -253,13 +347,21 @@ export function App(props: AppProps): React.ReactNode {
           onFinished={() => setView("today")}
         />
       )}
+      {/* 编辑原文：写是独占动作，自成一面（〔web-redesign 批 4 · C〕）。 */}
+      {view === "edit" && selectedId !== null && (
+        <RecordEditPanel
+          recordId={selectedId}
+          onSaved={refreshBadges}
+          /* 目的地由守卫那一侧带回来：用户点的是盒子 tab，丢弃后就该去盒子。 */
+          onLeave={(next) => leaveWithoutGuard(next ?? editFrom)}
+          notify={push}
+          onGuard={registerLeaveGuard}
+        />
+      )}
       {DEFERRED_VIEWS.includes(view) && (
         <section className="card">
           <h2>图谱</h2>
-          <p className="hint">图谱整体按裁定推迟，产品里没有这一页的入口。</p>
-          <p className="row-meta">
-            现在能回看的是盒子那五页：情绪 / 经历 / 念头 / 人物与事物 / 主题。
-          </p>
+          <p className="hint">图谱按裁定推迟，暂无入口。</p>
         </section>
       )}
     </Shell>

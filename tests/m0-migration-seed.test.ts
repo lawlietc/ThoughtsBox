@@ -39,6 +39,12 @@ const MIGRATION_NAMES = [
   "override_value_gate",
   "entity_types_v2",
   "schema_backfill_m2_debt",
+  "three_axis_contract",
+  "send_content_mode",
+  "privacy_job",
+  "graph_edge_ai_relations",
+  "narrow_run_live_index",
+  "entity_mask",
 ] as const;
 const CURRENT_SCHEMA_VERSION = MIGRATION_NAMES.length;
 const EXPECTED_TABLES = [
@@ -55,6 +61,7 @@ const EXPECTED_TABLES = [
   "episode",
   "graph_edge",
   "parse_run",
+  "privacy_job",
   "record_fts",
   "record_fts_config",
   "record_fts_data",

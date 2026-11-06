@@ -12,6 +12,7 @@ import {
   SUGGESTION_STATUS_LABEL,
 } from "./ui/labels.ts";
 import { boxGroupHeading, COUNT_PLACEHOLDER } from "./projectionPort.ts";
+import type { Basis, MentionStatus } from "./ui/types.ts";
 import type {
   BoxPageContent,
   BoxView,
@@ -685,6 +686,22 @@ export function productSuggestions(entries: readonly EffectiveEntry[]): Suggesti
 /* ── 记录详情「整理结果」那一块的可读行 ─────────────────────────── */
 
 /**
+ * 短词类里一个词要用的那点结构化事实（〔web-redesign 第二步 · 批 5 · 裁定 R3〕）。
+ *
+ * 为什么只给 `情绪` / `主题` 挂：另三类的标题是**句子或专名** —— `经历` 是一句摘要、
+ * `念头` 是整句、`人物与事物` 是名字。把句子摊进默认面，正是「整理结果看起来像原文」的病根；
+ * 把专名常驻在每一屏，等于把名字一直露在外面。它们只报数量，词面留在 `查看整理详情` 里。
+ */
+export interface ReadableChip {
+  /** 标准名（这一条没返回标准名时退回原话）—— 界面上那个词。 */
+  readonly label: string;
+  /** 原文里说出口的那个词，进 tooltip：证据回溯回到的是它，不是标准名。 */
+  readonly said: string;
+  readonly basis: Basis;
+  readonly status: MentionStatus;
+}
+
+/**
  * 一条可读结果：主标题 + 一行元信息 + 可点回原文的证据。
  *
  * `evidence` 原样带着（含 `start`/`end`），因为「点证据回原文并高亮」这一跳要的就是坐标；
@@ -695,12 +712,77 @@ export interface ReadableResultLine {
   readonly title: string;
   readonly meta: string;
   readonly evidence: EffectiveEvidenceDto;
+  /**
+   * 「人物与事物」那一组独有：这条提及指向的实体，与它在册的生命周期。
+   *
+   * 带的是**事实**不是动作 —— 投影不知道「转正」这个按钮存在，界面自己按
+   * `lifecycleStatus` 决定哪一行给动作（M8-D-1：只有待转正那一种状态有）。
+   * 之所以要连 id 一起给：提及行上的 id 是 `entity_mention` 的，转正作用于实体本身。
+   */
+  readonly entity?: { readonly id: string; readonly lifecycleStatus: string };
+  /** 只有短词类（`情绪` / `主题`）有：默认可见的 chip 行就用这一份，顺序与折叠件同源。 */
+  readonly chip?: ReadableChip;
 }
 
 export interface ReadableResultGroup {
   /** 类别名，与 `effectiveLines` 用的是同一批词（列表与详情得说同一种话）。 */
   readonly category: string;
   readonly lines: readonly ReadableResultLine[];
+}
+
+/* ── 默认可见的 chip 行（批 5 · 裁定 R3 / R6）───────────────────── */
+
+/**
+ * 短词类：显示具体的词。上面那三个是句子或专名，只报数量。
+ * 分法逐字来自 R3，不看长度也不看条数 —— 由用户裁定，不由字面长度反推。
+ */
+export const WORD_LEVEL_CATEGORIES: readonly string[] = ["情绪", "主题"];
+
+/** 长句类：只报数量。类别名与 `effectiveLines` / `readableResult` 逐字一致。 */
+export const COUNT_ONLY_CATEGORIES: readonly string[] = ["经历", "念头", "人物与事物"];
+
+/** 一行最多摊几个词（R6 裁定：6）。多出来的折成「…还有 N 个」。 */
+export const CHIP_LIMIT = 6;
+
+export interface FoldedChips {
+  readonly shown: readonly ReadableResultLine[];
+  readonly hidden: number;
+}
+
+/**
+ * 一排 chip 的取舍（R6）。
+ *
+ * 排序 `explicit` → `inferred` → 已移除：**被折走的一定是猜测，不会是一个事实被藏起来**。
+ * 同一档里保持投影给的顺序（`Array#sort` 自 ES2019 起稳定），于是「折起来的词」与
+ * 折叠件里的先后不会互相矛盾。
+ */
+export function foldChips(lines: readonly ReadableResultLine[]): FoldedChips {
+  // 放得下就一个都不动：排一次序会让 chip 行的先后与折叠件里的那份不一样，
+  // 而「列表与详情说同一种话」比「永远按依据排」更重要（§projections 的可读行同一口径）。
+  if (lines.length <= CHIP_LIMIT) return { shown: lines, hidden: 0 };
+  const rankOf = (line: ReadableResultLine): number => {
+    if (line.chip === undefined) return 3;
+    if (line.chip.status !== "active") return 2;
+    return line.chip.basis === "explicit" ? 0 : 1;
+  };
+  const sorted = [...lines].sort((left, right) => rankOf(left) - rankOf(right));
+  return {
+    shown: sorted.slice(0, CHIP_LIMIT),
+    hidden: Math.max(0, sorted.length - CHIP_LIMIT),
+  };
+}
+
+/**
+ * DTO 里的 `basis` / `status` 是字符串（取值集合由库里的 CHECK 与 `enums.json` 双向钉住）。
+ * 这里只回答界面要判断的一件事，且**说不准的时候一律往「少声称」那一侧降**：
+ * 说不清是不是原话 ⇒ 按「模型推断」画（不替它认领事实）；说不清还有效 ⇒ 按「已移除」画。
+ */
+function chipBasisOf(value: string): Basis {
+  return value === "explicit" ? "explicit" : "inferred";
+}
+
+function chipStatusOf(value: string): MentionStatus {
+  return value === "active" ? "active" : value === "superseded" ? "superseded" : "rejected";
 }
 
 /**
@@ -743,6 +825,12 @@ export function readableResult(effective: EffectiveResultDto): readonly Readable
       title: `「${item.labelSaid}」→ ${nameOf(item.conceptId)}`,
       meta: `${labelOf(BASIS_LABEL, item.basis)} · ${labelOf(MENTION_STATUS_LABEL, item.status)} · 强度 ${item.intensity ?? "没给"}${item.intensityModifiedByUser === true ? "（你改过的）" : ""} · 挂在${sourcePhrase(item.source.kind)}`,
       evidence: item.evidence,
+      chip: {
+        label: concepts.get(item.conceptId)?.canonicalName ?? item.labelSaid,
+        said: item.labelSaid,
+        basis: chipBasisOf(item.basis),
+        status: chipStatusOf(item.status),
+      },
     })),
   );
   push(
@@ -752,16 +840,26 @@ export function readableResult(effective: EffectiveResultDto): readonly Readable
       title: `「${item.labelSaid}」→ ${nameOf(item.conceptId)}`,
       meta: `${labelOf(BASIS_LABEL, item.basis)} · ${labelOf(MENTION_STATUS_LABEL, item.status)} · 挂在${sourcePhrase(item.source.kind)}`,
       evidence: item.evidence,
+      chip: {
+        label: concepts.get(item.conceptId)?.canonicalName ?? item.labelSaid,
+        said: item.labelSaid,
+        basis: chipBasisOf(item.basis),
+        status: chipStatusOf(item.status),
+      },
     })),
   );
   push(
     "人物与事物",
-    (effective.entityItems ?? []).map((item) => ({
-      id: item.id,
-      title: `「${item.labelSaid}」→ ${entities.get(item.entityId)?.displayName ?? "（这一条没返回显示名）"}`,
-      meta: `${labelOf(BASIS_LABEL, item.basis)} · ${labelOf(MENTION_STATUS_LABEL, item.status)}${item.role === null ? "" : ` · 角色 ${item.role}`} · 挂在${sourcePhrase(item.source.kind)}`,
-      evidence: item.evidence,
-    })),
+    (effective.entityItems ?? []).map((item) => {
+      const target = entities.get(item.entityId);
+      return {
+        id: item.id,
+        title: `「${item.labelSaid}」→ ${target?.displayName ?? "（这一条没返回显示名）"}`,
+        meta: `${labelOf(BASIS_LABEL, item.basis)} · ${labelOf(MENTION_STATUS_LABEL, item.status)}${item.role === null ? "" : ` · 角色 ${item.role}`} · 挂在${sourcePhrase(item.source.kind)}`,
+        evidence: item.evidence,
+        ...(target === undefined ? {} : { entity: { id: target.id, lifecycleStatus: target.lifecycleStatus } }),
+      };
+    }),
   );
   return groups;
 }

@@ -12,6 +12,7 @@
 
 import enumsJson from "../../shared/constants/enums.json" with { type: "json" };
 import type { EnumFile } from "../../shared/contracts/enums.ts";
+import { JOB_STATUS_DTO_VALUES } from "../../shared/dto.ts";
 
 /** 与 `contracts/enums.ts` 同一份结构声明，这里不另抄一遍字段形状。 */
 const enums = enumsJson as unknown as EnumFile;
@@ -60,9 +61,12 @@ export const STATUS_LABEL = labeled("STATUS_LABEL", ENUM_VALUES.processingStatus
 });
 
 export const MODE_LABEL = labeled("MODE_LABEL", ENUM_VALUES.processingModes, {
-  manual_only: "只自己看，不送模型",
+  manual_only: "仅保存",
   local_model: "本地模型",
-  cloud_redacted: "云端（脱敏后发送）",
+  cloud_redacted: "云端（本地脱敏）",
+  // 第 4 个模式值（草案 §五）：缺这一条，`labeled()` 的装载期双向核对直接抛异常 = 整站白屏。
+  // 标签把「发的是什么」写在明面上，不与脱敏档共用一句话。
+  cloud_raw: "云端（原文发送）",
 });
 
 export const ENTITY_TYPE_LABEL = labeled("ENTITY_TYPE_LABEL", ENUM_VALUES.entityTypes, {
@@ -138,4 +142,21 @@ export const EVENT_TIME_CERTAINTY_LABEL = labeled("EVENT_TIME_CERTAINTY_LABEL", 
   explicit: "原文写明",
   approximate: "约摸",
   unknown: "原文未提",
+});
+
+/**
+ * 后台任务状态的中文标签（M6-1D 手动入队那一块）。
+ *
+ * 这一张表的取值清单**不来自 enums.json**：调度状态是 `privacy_job` 那行的 CHECK（迁移 0010），
+ * 不在记录/派生契约的枚举面里。它的前端来源是 `shared/dto.ts` 的 `JOB_STATUS_DTO_VALUES`
+ * （那条封闭清单由 `tests/m6-0e-job-routes.test.ts` 与服务端 `JOB_STATUSES` 逐字对账钉死）。
+ * 双向核对的手法与上面各表一致：新增一档而这里没写标签 ⇒ 装载期即抛，不让界面显示空白档。
+ */
+export const JOB_STATUS_LABEL = labeled("JOB_STATUS_LABEL", JOB_STATUS_DTO_VALUES, {
+  queued: "已排到后台，等待处理",
+  redacting: "后台处理中：本机脱敏",
+  analyzing: "后台处理中：正在整理",
+  done: "后台处理完成",
+  failed: "后台处理未成功",
+  canceled: "后台任务已取消",
 });

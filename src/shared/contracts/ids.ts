@@ -25,6 +25,7 @@ export const ID_PREFIXES = {
   triggerAssertion: "trig",
   suggestion: "sug",
   parseRun: "run",
+  privacyJob: "pjob",
   sleepSession: "sleep",
   emotionMention: "em",
   topicMention: "tm",

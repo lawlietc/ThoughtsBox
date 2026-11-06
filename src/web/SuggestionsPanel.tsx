@@ -58,7 +58,6 @@ export function SuggestionsPanel(props: SuggestionsPanelProps): React.ReactNode 
             </button>
           ))}
         </div>
-        <p className="hint">忽略不会删除；采纳和撤回是终态。</p>
       </section>
 
       <section className="card">

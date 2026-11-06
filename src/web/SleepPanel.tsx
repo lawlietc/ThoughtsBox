@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ApiError, api } from "./apiClient.ts";
+import { processingPatchForScope, resolveEntryMode } from "./modeDefaults.ts";
 import { clockOf, firstLine } from "./projections.ts";
 import { RecordList } from "./RecordList.tsx";
 import { ProcessingModePicker } from "./ui/ProcessingModePicker.tsx";
 import type { RecordRowView } from "./projections.ts";
+import type { ProcessingModeAvailabilityDto } from "../shared/dto.ts";
 
 /**
  * 「睡前收尾」（spec §2.1(11) / §2.4 / M3 验收）。
@@ -17,6 +19,9 @@ import type { RecordRowView } from "./projections.ts";
  *
  * 违反其中任何一条，这页就退化成换了名字的待办中心 —— 和它的产品目标（结束本次使用）正好相反。
  * 所以这一页故意「什么都没有」：没有侧栏计数、没有红点、没有「你可能还想看」。那不是没画完。
+ *
+ * 整理方式（四档）在这里可选，初始值来自设置页的**同一个默认值**（`recordDefaultMode`）：
+ * 写入页、睡前页、设置页共用这一个值，在这里改档会立即回写它，三处因此永远一致。
  */
 
 export interface SleepPanelProps {
@@ -29,11 +34,55 @@ export interface SleepPanelProps {
 export function SleepPanel(props: SleepPanelProps): React.ReactNode {
   const [text, setText] = useState("");
   const [mode, setMode] = useState("manual_only");
+  const [availability, setAvailability] = useState<ProcessingModeAvailabilityDto | null>(null);
+  const touchedMode = useRef(false);
+  const preferenceWrite = useRef<Promise<unknown>>(Promise.resolve());
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   /** 本轮放进来的那几条（不是「今天的全部记录」）：id + 刚存下的原文与时间。 */
   const [added, setAdded] = useState<readonly RecordRowView[]>([]);
   const [ended, setEnded] = useState(false);
+
+  // 进入本页先从配置初始化（与设置页、写入页同一个值）；拿不到配置就留在 manual_only。
+  useEffect(() => {
+    let active = true;
+    api
+      .ingestConfig()
+      .then((cfg) => {
+        if (!active) return;
+        const resolved = resolveEntryMode(cfg.processingDefaults.recordDefaultMode, cfg.processingAvailability);
+        setAvailability(cfg.processingAvailability);
+        if (!touchedMode.current) setMode(resolved.mode);
+        if (resolved.fellBack) setNotice("保存的默认整理方式当前不可用，这一条先按「仅保存」处理。");
+      })
+      .catch(() => {
+        // 读不到配置不拦收尾本身：保持 manual_only，不谎称知道可用性。
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (notice === null) return;
+    const timer = setTimeout(() => setNotice(null), 6000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  /** 三处共用同一个默认值：本页改档立即回写 `recordDefaultMode`，设置页/写入页随之一致。 */
+  function selectMode(next: string): void {
+    touchedMode.current = true;
+    setMode(next);
+    const patch = processingPatchForScope("record", next);
+    preferenceWrite.current = preferenceWrite.current
+      .catch(() => undefined)
+      .then(() => api.updateProcessingDefaults(patch))
+      .then(
+        () => undefined,
+        () => undefined,
+      );
+  }
 
   async function put(): Promise<void> {
     if (adding || text.trim() === "") return;
@@ -63,9 +112,7 @@ export function SleepPanel(props: SleepPanelProps): React.ReactNode {
         <section className="card closing">
           <h2 className="closing-line">这些事情已经收好了。</h2>
           <p className="closing-line">明天想继续时，我们再打开。</p>
-          <p className="hint">
-            今晚放进去 {added.length} 条。它们已经存在本机 —— 你可以直接关掉这个窗口。
-          </p>
+          <p className="hint">今晚放进去 {added.length} 条。</p>
           <div className="actions">
             <button className="btn primary" onClick={props.onFinished}>
               直接退出
@@ -83,10 +130,6 @@ export function SleepPanel(props: SleepPanelProps): React.ReactNode {
     <div className="columns">
       <section className="card">
         <h2>睡前收尾</h2>
-        <p className="hint">
-          把今天还没倒出来的写下来，放一条存一条，再收好。<strong>不用整理，不用分类，不用管之前记了什么。</strong>
-        </p>
-
         <textarea
           rows={6}
           placeholder="现在脑子里还有什么……"
@@ -94,7 +137,13 @@ export function SleepPanel(props: SleepPanelProps): React.ReactNode {
           onChange={(event) => setText(event.target.value)}
         />
 
-        <ProcessingModePicker name="sleep-mode" value={mode} onChange={setMode} />
+        <ProcessingModePicker
+          name="sleep-mode"
+          value={mode}
+          onChange={selectMode}
+          availability={availability}
+        />
+        {notice !== null && <p className="flash">{notice}</p>}
         <p className="hint">这里只负责保存；只有选了本机整理或云端发送，才会进入「待整理」。</p>
 
         <div className="actions">
@@ -117,7 +166,6 @@ export function SleepPanel(props: SleepPanelProps): React.ReactNode {
             收好并结束
           </button>
         </div>
-        <p className="hint">这里不会数你还有多少条没处理，也不挽留。</p>
       </section>
     </div>
   );

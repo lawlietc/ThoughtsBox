@@ -36,8 +36,7 @@ export function SourceText(props: SourceTextProps): React.ReactNode {
         <p className="raw">{props.text}</p>
         {(highlight !== null || props.missingMessage !== undefined) && (
           <p className="warn">
-            {props.missingMessage ??
-              "这一条证据点不回当前版本：当前原文里找不到这段文字。上面显示的是当前版本。"}
+            {props.missingMessage ?? "这段证据不在当前版本里。"}
           </p>
         )}
       </>

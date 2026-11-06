@@ -163,7 +163,7 @@ function CitationView(props: {
                 : null
             }
             missingMessage={
-              evidence === null ? undefined : `这一条证据点不回当前版本：${evidencePhrase(evidence)}`
+              evidence === null ? undefined : `证据不在当前版本：${evidencePhrase(evidence)}`
             }
           />
         </>

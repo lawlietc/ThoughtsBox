@@ -241,7 +241,6 @@ input[type="text"] {
 .tab-btn:focus-visible,
 .sub-btn:focus-visible,
 .row-btn:focus-visible,
-.link-btn:focus-visible,
 .timeline-item:focus-visible,
 .today-secondary:focus-visible,
 .today-pending:focus-visible,
@@ -1431,7 +1430,8 @@ input[type="text"] {
   font-size: 1rem;
 }
 
-body:has(.box-detail-dialog[open]) {
+body:has(.box-detail-dialog[open]),
+body:has(.modal-sheet[open]) {
   overflow: hidden;
 }
 
@@ -1611,6 +1611,91 @@ body:has(.box-detail-dialog[open]) {
   align-items: center;
   justify-content: flex-end;
   gap: 0.5rem;
+}
+
+/* ── 统一反馈面（web-redesign 批 2 · 事项 I）──────────────────────
+ * 全站只有一个提示位：外壳里、`.app-main` 之外。
+ * 挂在滚动区外面是为了「说失败的那句话不会被滚上去看不见」；窄屏改成 sticky，
+ * 是因为那一屏整页都在滚，不 sticky 就等于一出现就滚没了。
+ * 颜色全借既有变量（`--accent` / `--danger` / `--amber` 各管一类），不动主色调。
+ */
+.notice-bar {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.notice.ok {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.notice.error {
+  border-left-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+}
+
+.notice.status {
+  border-left-color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 9%, var(--surface));
+}
+
+.notice-text {
+  flex: 1 1 16rem;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice .disclosure {
+  flex: 1 0 100%;
+}
+
+.notice-action {
+  min-height: 2.5rem;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.86rem;
+  cursor: pointer;
+}
+
+.notice-action:hover {
+  background: var(--hover);
+}
+
+/* 关掉提示是整条里最小的动作：小、方正、自己占得住触控面积。 */
+.notice-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.5rem;
+  min-width: 2.5rem;
+  border: none;
+  border-radius: 0.6rem;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.notice-close:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 
 /* ── 三个主 tab：产品的骨架 ──────────────────────────────────────
@@ -1846,6 +1931,16 @@ body:has(.box-detail-dialog[open]) {
 
   .app-head .lede {
     display: none;
+  }
+
+  /* 整页都在滚，提示条不 sticky 就等于一出现被滚没了。层级压在底部导航栏之下 ——
+     它可以让路给导航栏，导航栏不让给它。 */
+  .notice-bar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    padding-top: 0.5rem;
+    background: var(--bg);
   }
 
   /* ── 窄屏下几处「宽屏才合理」的排布 ────────────────────────── */
@@ -2374,7 +2469,7 @@ body:has(.box-detail-dialog[open]) {
   grid-column: 1 / -1;
 }
 
-.model-field input,
+.model-field input:not([type="checkbox"]),
 .model-field select {
   width: 100%;
   min-width: 0;
@@ -2386,6 +2481,13 @@ body:has(.box-detail-dialog[open]) {
   background: var(--surface-raised);
   color: inherit;
   font: inherit;
+}
+
+.model-check input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  accent-color: var(--accent);
 }
 
 .model-check {
@@ -2440,6 +2542,27 @@ body:has(.box-detail-dialog[open]) {
 }
 
 /* ══ M5-5C · 记录详情：先读原文，状态与配置退后 ═══════════════════ */
+/* 〔web-redesign 第二步 · 试点：全部记录详情页〕
+   这一屏只允许一个声音最大，就是用户自己写的那段话。三条规矩：
+     · 原文是唯一的「纸面」（沿用 M5-4P/M5-5B 那张便签的底色、光、留白），字号与行距全页最大，
+       字面走 --font-display —— 读起来像自己写的字，不像表格。
+     · 栏目的名字降到眉标（0.82rem、muted、无衬线）。「原文」这两个字直接退出版面：
+       那块内容不需要自我介绍，需要名字的是机器写的那一段（整理结果），免得被当成用户的话。
+     · 配置、历史、技术值降到页脚一排无框折叠；主行动只剩一颗实心按钮，其余退到安静链接。
+   主色一个都没动，改的是「谁最响」。 */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .detail-page {
   display: grid;
   gap: 1.5rem;
@@ -2447,15 +2570,37 @@ body:has(.box-detail-dialog[open]) {
   max-width: 48rem;
 }
 
-.detail-primary,
 .detail-result {
   display: grid;
   gap: 0.9rem;
+  /* 〔用户裁定 2026-11-03〕这一栏用**底色**圈起来，不是线条框：
+     机器写的那一段因此和用户自己那张纸（`.detail-primary`，`--surface`）分开，
+     又不至于多出一张描边卡片。比页面底色深一档 —— 也就是「把 hover 那一档铺满」。
+     暗色下 ink 是浅的，这个混色会略微**提亮**：夜里没有比近黑更深的台阶，
+     而一块稍亮的底本来就是暗色界面里「这张面板在这儿」的常规写法。 */
+  padding: clamp(1rem, 2.6vw, 1.35rem);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--ink) 6%, var(--bg));
+}
+
+/* 这一块自己已经是「一个框」了，里面的折叠件不再自带描边（否则框套框）。
+   缩进也归零：它要和上面的状态、词行左对齐。 */
+.detail-result .disclosure {
+  padding-left: 0;
+  padding-right: 0;
+  border: none;
 }
 
 .detail-primary {
-  padding: clamp(0.4rem, 2vw, 0.8rem) 0 1.5rem;
-  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 1rem;
+  padding: clamp(1.25rem, 3vw, 2rem);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(95% 80% at 100% 0%, var(--glow), transparent 64%),
+    var(--surface);
+  box-shadow: var(--shadow);
 }
 
 .detail-heading {
@@ -2471,53 +2616,233 @@ body:has(.box-detail-dialog[open]) {
   margin: 0;
 }
 
-.detail-status,
-.detail-version,
-.detail-run-state {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.84rem;
-}
-
 .detail-status {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.45rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+/* 眉标：栏目的名字。它给的是「这一段是谁写的」，不是又一个标题。 */
+.detail-kicker {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+}
+
+.detail-state {
+  padding: 0.08rem 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: color-mix(in srgb, var(--accent) 70%, var(--ink));
+  font-size: 0.78rem;
+}
+
+.detail-state.fail {
+  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+/* ── 〔批 5 · E〕整理结果栏默认可见的那一层 ──────────────────────────
+ * 状态在上一行（`.detail-heading`），这里只放「算出了什么」：
+ * 短词类是具体的词（可点回原文），长句类只有数量。两行都走同一套 w muted 字号 ——
+ * 它们是读数，不该和用户自己写的那段字比响度。 */
+.result-chips {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.3rem 0.5rem;
+}
+
+.chip-row-label {
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+}
+
+/* 折走的那几个：说的是「还有」，不是一个能点的东西。 */
+.chip-more {
+  color: var(--muted);
+  font-size: 0.82rem;
+  align-self: center;
+}
+
+.result-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.9rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 .detail-primary .raw {
-  font-size: 1.05rem;
-  line-height: 1.85;
-}
-
-.detail-version {
-  justify-self: end;
-  font-variant-numeric: tabular-nums;
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  line-height: 2.05;
 }
 
 .detail-actions {
   margin-top: 0.15rem;
 }
 
-.detail-editor {
-  display: grid;
-  gap: 0.65rem;
-  padding: 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--surface);
+/* 〔web-redesign 第二步 · 批 3 · B〕原文栏这一排只剩两个可点：`编辑原文` 与行末的「⋯」。
+   删除记录语义已固化（图标不会认错），且它是唯一不可逆的那一个，收进菜单而不是并排站着。
+   触发件是原生 `<details>/<summary>`：键盘可聚焦、Enter/Space 可开，不做 hover-only；
+   命中区 44×44（`.btn` 那一档），不跟随次级 pill 的 40px —— 它是图标件，不是一排里的第三个文字链接。 */
+.detail-more {
+  position: relative;
+  margin-left: auto;
 }
 
-.detail-result {
-  padding-top: 0.25rem;
+.detail-more > .detail-more-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  /* 收起原生三角：这里是图标件，箭头会和「⋯」抢注意力。 */
+  list-style: none;
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.detail-more > .detail-more-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.detail-more > .detail-more-toggle:hover,
+.detail-more[open] > .detail-more-toggle {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.detail-more > .detail-more-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.detail-more-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  z-index: 5;
+  min-width: 9.5rem;
+  padding: 0.3rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+}
+
+/* 不可逆的那个动作：红色只在它自己的字上，不靠一整块边框圈出「危险区」。 */
+.detail-more-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.75rem;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.detail-more-item:hover {
+  background: var(--hover);
+}
+
+.detail-more-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 〔批 3 · F / 批 4 · C+D〕模态的那一层壳。两个用户：重算的两条路、保存确认与「还没保存」。
+   它们要的是同一件事——背景压掉、只让这一个决定留在屏上——所以只有一版样式，不做第二份。 */
+.modal-sheet {
+  position: fixed;
+  inset: 0;
+  width: min(30rem, calc(100vw - 2rem));
+  max-width: 30rem;
+  max-height: 80dvh;
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(100% 80% at 100% 0%, var(--glow), transparent 58%),
+    var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1.2rem 3.2rem color-mix(in srgb, #1d241f 32%, transparent);
+}
+
+.modal-sheet::backdrop {
+  background: color-mix(in srgb, #1b211e 42%, transparent);
+}
+
+.modal-sheet-body {
+  display: grid;
+  gap: 0.85rem;
+  max-height: 80dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1.25rem 1.2rem 1.35rem;
+}
+
+.modal-sheet-body h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.modal-sheet-body p {
+  margin: 0;
+  line-height: 1.75;
+}
+
+.modal-option {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  justify-items: start;
+}
+
+.modal-option h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.modal-option p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.7;
 }
 
 .detail-title {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 1.18rem;
+  font-size: 1.08rem;
   font-weight: 600;
+  line-height: 1.6;
 }
 
 .candidate-panel {
@@ -2533,18 +2858,50 @@ body:has(.box-detail-dialog[open]) {
   margin: 0;
 }
 
-.danger-zone {
+/* 页脚那一排折叠：一件没少，只是不再当内容中间的三堵表单墙。 */
+.detail-foot {
   display: grid;
-  justify-items: start;
-  gap: 0.65rem;
-  padding-top: 1rem;
+  gap: 0;
+  padding-top: 0.35rem;
   border-top: 1px solid var(--line);
 }
 
-.danger-zone h3 {
-  margin: 0;
+.detail-foot > .disclosure {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+}
+
+/* 〔用户裁定 2026-11-03〕两条折叠行之间那一行空白是这条 `min-height` 造成的：
+   它对**内容盒**生效（44px），而 `list-item` 把文字顶在上沿，于是每条 summary 底下
+   多出 20 多像素的空 —— 实测每条 79px、字只占 21.6px，两条之间就像空了一整行。
+   padding 上下各 0.7rem（11.2×2）加一行字本来就有 44px 的命中区，这条 `min-height` 是多余的，
+   删掉之后文字被上下 padding 居中，两条 summary 紧挨着，命中区仍是 44px。 */
+.detail-foot .disclosure > summary {
+  /* 〔批 1〕原先是 `display: flex`：flex 一上，原生 `▸` 就不再渲染（实测 marker
+     计算值还在、画不出来），页脚几条因此变成"能点的灰字变成不能点的灰字"。
+     回到 `list-item` 把可点记号找回来，与「查看整理详情」那一支同一待遇。 */
+  display: list-item;
+  padding: 0.7rem 0;
   color: var(--muted);
-  font-size: 0.95rem;
+  font-weight: 600;
+  opacity: 1;
+}
+
+/* 页脚里的整理方式用的是快速记录那个选择器（同一套组件）。两处只让一处画分隔线：
+   `.detail-foot` 顶上已经有一条，选择器自带的 `border-top` 在页脚里会变成第二条。 */
+.detail-foot .quick-mode {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* 详情页把「保存模式 / 说明」经 `children` 塞进了选择器里（快速记录没有这一块）。 */
+.detail-foot .quick-mode > .actions {
+  margin-top: 0.7rem;
+}
+
+.detail-foot .quick-mode > .hint {
+  margin-top: 0.45rem;
 }
 
 /* ══ M5-4P · 「今天」页视觉试改 ═════════════════════════════════════
@@ -2691,24 +3048,10 @@ body:has(.box-detail-dialog[open]) {
   color: var(--warm);
 }
 
-.link-btn {
-  padding: 0.4rem 0;
-  min-height: 2.5rem;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  font: inherit;
-  font-size: 0.9rem;
-  text-decoration: underline;
-  text-decoration-color: var(--line-strong);
-  text-underline-offset: 0.35em;
-}
-
-.link-btn:hover {
-  color: var(--accent);
-  text-decoration-color: currentColor;
-}
+/* 〔web-redesign 批 7〕`.link-btn` 已退场：它最后一个用户是今天页的「全部片段」，
+   现在换成 `.btn`。留着这个类只会在下一次「这颗链接该多高」时又变成一档半高不低的触控 ——
+   全站可点件因此只有 `.btn`（44px）、`.tab-btn`（56px）与 `.sub-btn` / `.theme-toggle`（40px）三档，
+   且每一档都有明确归属。 */
 
 .today-pending {
   justify-self: start;
@@ -2794,4 +3137,171 @@ body:has(.box-detail-dialog[open]) {
   .box-ball {
     transition: none;
   }
+}
+
+/* ══ 待整理页右侧「操作」框（web-redesign 第三步）═════════════════════
+ * 这一框从「一张把所有开关摆出来的表单」改成「按阶段推进的决定面」：
+ *   阶段名（我在哪一步）→ 要发出去的东西 → 发送方式（一行摘要）→ 一行动作。
+ * 视觉沿用本页原来的卡片（纸面 + 描边），不套整理结果那种底色块。 */
+
+.ingest-act {
+  display: grid;
+  gap: 0.75rem;
+}
+
+/* 头只有一样东西是主：阶段名。徽章退到右边，字号压到跟标签同级。 */
+.ingest-act-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.4rem 0.75rem;
+}
+
+.ingest-stage {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.ingest-flags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+/* 「实际发送文本」这一行小标：它是这一段是谁写的（机器发出去的），不是标题。 */
+.ingest-caption {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+}
+
+/* 原文块封顶 + 内部滚动：动作行必须永远落在这一框的最后一行，
+   不能被一段长原文顶到屏幕外。 */
+.ingest-payload {
+  max-height: 14rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+
+.ingest-payload .record-text {
+  margin: 0;
+}
+
+/* 「待确认：遮 N 处 · M 个名字待审 ▸」——整行是一个入口，不是可展开的框。 */
+.ingest-review {
+  justify-self: start;
+  min-height: 2.25rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.ingest-review:hover {
+  background: var(--hover);
+}
+
+/* 发送方式那一行：只报结论（脱敏 · 规则 + 实体记忆），点了开**弹窗**。
+   不在框里就地展开 —— 一展开就在「发什么」和「动作行」之间插进五六行控件。 */
+.ingest-method-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.35rem 0;
+  border: none;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+}
+
+.ingest-method-link:hover {
+  color: var(--accent);
+}
+
+.ingest-method-chevron {
+  flex: none;
+}
+
+/* 动作行：主按键在左，「排到后台」是旁路、退到右端。 */
+.ingest-actions {
+  justify-content: space-between;
+}
+
+.ingest-side {
+  min-height: 2.75rem;
+  padding: 0.35rem 0.4rem;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.9rem;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 0.35em;
+}
+
+.ingest-side:hover {
+  color: var(--accent);
+  text-decoration-color: currentColor;
+}
+
+/* 弹窗里的小节标题：两个问题各占一段。 */
+.send-review-title {
+  margin: 0.2rem 0 0;
+  font-size: 0.95rem;
+}
+
+.send-review-spans .item,
+.send-review-term {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* 遮蔽清单的每一处：原文 → 占位符 → 谁遮的。原文必须看得见 ——
+   只给 `[person_1_ab12]` 的话，用户没有任何办法核对遮的是谁。 */
+.send-review-span {
+  flex-wrap: wrap;
+  row-gap: 0.15rem;
+}
+
+/* 来源那句话另起一行：让「原文 → 占位符」这一对留在同一行里，
+   否则它们会被来源挤开，读者还得自己拼「哪个替换了哪个」。 */
+.send-review-source {
+  flex: 1 0 100%;
+}
+
+.send-review-original {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.send-review-original-missing {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.send-review-term label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 1;
 }

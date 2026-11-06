@@ -44,6 +44,7 @@ import {
   createRecord,
   envelope,
   makeAdapter,
+  setRecordMode,
   stubTransport,
   validOutput,
 } from "./helpers/ingestFixtures.ts";
@@ -192,7 +193,7 @@ function expectAccepted(statement: () => void): void {
 
 describe("闸门：不该发出的请求，物理上是零次调用、零行写入", () => {
   it("manual_only：不调用任何模型、不建 run 行、记录态原地不动", async () => {
-    db.prepare("update capture_record set processing_mode = 'manual_only' where id = ?").run(recordId);
+    setRecordMode(db, recordId, "manual_only");
     const stub = stubTransport(OK_ENVELOPE(validOutput()));
     const service = makeService({ transport: stub.transport });
     let thrown: unknown;
@@ -210,7 +211,7 @@ describe("闸门：不该发出的请求，物理上是零次调用、零行写�
   });
 
   it("裁决 h：cloud_redacted 缺本次脱敏映射 ⇒ 发起调用之前即拒，零调用零写入", async () => {
-    db.prepare("update capture_record set processing_mode = 'cloud_redacted' where id = ?").run(recordId);
+    setRecordMode(db, recordId, "cloud_redacted");
     const stub = stubTransport(OK_ENVELOPE(validOutput()));
     const service = makeService({
       adapter: makeAdapter({ baseUrl: CLOUD_BASE_URL }),
@@ -241,7 +242,7 @@ describe("闸门：不该发出的请求，物理上是零次调用、零行写�
   });
 
   it("cloud_redacted 缺授权闸门 ⇒ 零调用；授权闸门抛 ⇒ 同样零调用零写入", async () => {
-    db.prepare("update capture_record set processing_mode = 'cloud_redacted' where id = ?").run(recordId);
+    setRecordMode(db, recordId, "cloud_redacted");
     const { map, redactedText } = redact(CLOUD_RAW, collectKnownEntities(db), { nonce: "cafe01" });
     const withoutGate = makeService({ adapter: makeAdapter({ baseUrl: CLOUD_BASE_URL }) });
     await expect(withoutGate.ingest({ recordRevisionId: revisionId, payloadText: redactedText, redactionMap: map })).rejects.toBeInstanceOf(IngestInputError);
@@ -355,17 +356,27 @@ describe("T-05：parse_run 双态的合法/非法组合与采纳的原子切换"
     );
   });
 
-  it("ux_run_live：同 (revision, fingerprint) 的第二条 live run 被拒；不同 fingerprint 放行", () => {
-    insertRunRow("run_live_a", { execution_status: "succeeded", result_state: "current", key: "k_live_a", fingerprint: HEX64 });
+  it("ux_run_live（0012 收窄）：同 (revision, fingerprint) 的第二条在途 run 被拒；定案的旧结果与新候选共存", () => {
+    // 在途互斥仍然物理成立：running + queued 是同一条管线上的两份在途工作，第二条写不进去。
     expectRejected(
-      () => insertRunRow("run_live_b", { execution_status: "running", result_state: "candidate", key: "k_live_b", fingerprint: HEX64 }),
-      /UNIQUE constraint failed/,
+      () => {
+        insertRunRow("run_live_a", { execution_status: "running", result_state: "candidate", key: "k_live_a", fingerprint: HEX64 });
+        insertRunRow("run_live_b", { execution_status: "queued", result_state: "candidate", key: "k_live_b", fingerprint: HEX64 });
+      },
+      /UNIQUE constraint failed: parse_run.source_revision_id, parse_run.pipeline_fingerprint/,
     );
+    // 重新分析的前提（m8-2 R2 走的就是这一步）：旧 run 定案成 current 之后不再占位在途索引，
+    // 同指纹的新 candidate 与它同时存在；「至多一个 current」由 ux_run_current 独家守。
+    expectAccepted(() => {
+      insertRunRow("run_live_old", { execution_status: "succeeded", result_state: "current", key: "k_live_old", fingerprint: HEX64 });
+      insertRunRow("run_live_c", { execution_status: "running", result_state: "candidate", key: "k_live_c", fingerprint: HEX64 });
+    });
+    // 不同 fingerprint = 不同管线，在途名额各自算，照旧放行。
     expectAccepted(() =>
-      insertRunRow("run_live_c", {
+      insertRunRow("run_live_d", {
         execution_status: "running",
         result_state: "candidate",
-        key: "k_live_c",
+        key: "k_live_d",
         fingerprint: "c".repeat(64),
       }),
     );
@@ -377,7 +388,10 @@ describe("T-05：parse_run 双态的合法/非法组合与采纳的原子切换"
     expect(first.service.adoptCurrent({ candidateRunId: a.runId }).supersededRunId).toBeNull();
     expect(statusOf("parse_run", a.runId)).toBe("current");
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    // 「第二次 ingest 要落在另一条管线上」——这里要的是一个与默认值**不同**的版本串，
+    // 别写真实版本号：DEFAULT_PROMPT_VERSION 一升到该值，两次请求就变回同一条管线，
+    // 被认成重放，断言静默失效。
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     expect(statusOf("parse_run", b.runId)).toBe("candidate");
 
@@ -394,7 +408,7 @@ describe("T-05：parse_run 双态的合法/非法组合与采纳的原子切换"
     const first = localStub();
     const a = await first.service.ingest({ recordRevisionId: revisionId });
     first.service.adoptCurrent({ candidateRunId: a.runId });
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     const oldEpisode = selectIds("select id from episode where parse_run_id = ?", a.runId);
     expect(oldEpisode.length).toBe(1);
@@ -421,15 +435,17 @@ describe("T-05：parse_run 双态的合法/非法组合与采纳的原子切换"
 
     // 换一个指纹：同一 (revision, fingerprint) 的同键请求会被认成**重放**（上面那条 run 已经
     // succeeded/current），拿不到「failed 的 run」这一形态。指纹不同才是新 run。
+    // 版本串要的是「与默认值不同」，故用合成串：写真实版本号的话，DEFAULT_PROMPT_VERSION
+    // 一升到该值这两条 run 就变回同一条管线，断言静默失效。
     const failedService = makeService({
-      promptVersion: "m2-prompt-v5",
+      promptVersion: "test-prompt-failing",
       transport: { send: async () => ({ status: 503, body: "{}" }) },
     });
     const failed = await failedService.ingest({ recordRevisionId: revisionId });
     expect(failed.succeeded).toBe(false);
     expect(() => failedService.adoptCurrent({ candidateRunId: failed.runId })).toThrow(/执行成功/);
     // 放弃候选：candidate→superseded，历史保留。
-    const second = makeService({ promptVersion: "m2-prompt-v3", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const c = await second.ingest({ recordRevisionId: revisionId });
     second.discardCandidate(c.runId);
     expect(statusOf("parse_run", c.runId)).toBe("superseded");
@@ -499,7 +515,9 @@ describe("T-18：状态机合法/非法转换（§4.7 双态 + §4.8 处理态�
     const first = localStub();
     await first.service.ingest({ recordRevisionId: revisionId });
     expect(recordStatus()).toBe("parsed");
-    const second = makeService({ promptVersion: "m2-prompt-v9", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    // 第二次必须落在**另一条管线**上才是新 run（同键同管线会被认成重放，走不到状态机这一面）。
+    // 合成串而非真实版本号：DEFAULT_PROMPT_VERSION 一升到该值，这条测试就静默失效。
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const result = await second.ingest({ recordRevisionId: revisionId });
     expect(result.succeeded).toBe(true);
     expect(recordStatus()).toBe("parsed");
@@ -579,7 +597,7 @@ describe("T-19：候选永不进入当前视图，采纳只换那一套行", () 
     expect(viewA.emotions).toEqual(selectIds("select id from emotion_mention where parse_run_id = ?", a.runId));
     expect(viewA.topics).toEqual(selectIds("select id from topic_mention where parse_run_id = ?", a.runId));
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     second.adoptCurrent({ candidateRunId: b.runId });
 
@@ -604,7 +622,7 @@ describe("T-19：候选永不进入当前视图，采纳只换那一套行", () 
     const untouchedThought = first.service.currentView(revisionId).thoughts[0]!;
     corrections.setOverride({ objectTable: "episode", objectId: touchedEpisode, fieldName: "summary", valueJson: '"我自己写的摘要"' });
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     second.adoptCurrent({ candidateRunId: b.runId });
 
@@ -625,7 +643,7 @@ describe("T-19：候选永不进入当前视图，采纳只换那一套行", () 
     const oldEpisode = first.service.currentView(revisionId).episodes[0]!;
     corrections.setOverride({ objectTable: "episode", objectId: oldEpisode, fieldName: "summary", valueJson: '"修正后的摘要"' });
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     const newEpisode = selectIds("select id from episode where parse_run_id = ?", b.runId)[0]!;
     second.adoptCurrent({
@@ -726,7 +744,7 @@ describe("T-06 服务面：remove 补丁之后任何 run 命中即 rejected，�
     expect(corrections.patchCount()).toBe(before + 1);
 
     // 重跑一条新管线：candidate 也不例外——命中即 rejected。
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     expect(b.succeeded).toBe(true);
     expect(b.writes.rejectedMentions).toBe(1);
@@ -746,7 +764,7 @@ describe("T-06 服务面：remove 补丁之后任何 run 命中即 rejected，�
     const episode = first.service.currentView(revisionId).episodes[0]!;
     corrections.removeMember({ containerTable: "episode", containerId: episode, collection: "emotions", memberId: ANXIETY_CONCEPT });
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     second.adoptCurrent({ candidateRunId: b.runId });
 
@@ -766,7 +784,7 @@ describe("T-06 服务面：remove 补丁之后任何 run 命中即 rejected，�
     const mention = selectIds("select id from emotion_mention where parse_run_id = ?", a.runId)[0]!;
     db.prepare("update emotion_mention set status = 'rejected' where id = ?").run(mention);
 
-    const second = makeService({ promptVersion: "m2-prompt-v2", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
+    const second = makeService({ promptVersion: "test-prompt-next", transport: stubTransport(OK_ENVELOPE(validOutput())).transport });
     const b = await second.ingest({ recordRevisionId: revisionId });
     expect(b.writes.rejectedMentions).toBe(1);
     expect(statusOf("emotion_mention", selectIds("select id from emotion_mention where parse_run_id = ?", b.runId)[0]!)).toBe("rejected");
@@ -967,7 +985,7 @@ describe("裁决 2：降级留痕对外收敛为数组，与 Provider 的诊断�
       },
       trace,
     });
-    db.prepare("update capture_record set processing_mode = 'local_model' where id = ?").run(recordId);
+    setRecordMode(db, recordId, "local_model");
     const result = await service.ingest({ recordRevisionId: revisionId });
     expect(result.succeeded).toBe(false);
     expect(result.errorKind).toBe("invalid_json");

@@ -20,7 +20,7 @@
 import { ProviderError, type ProviderTransport, type TransportRequest, type TransportResponse } from "./provider.ts";
 
 /**
- * 无状态单例：密钥在发送那一刻由 `invokeExtraction` 从 `process.env[apiKeyEnv]` 取好放进
+ * 无状态单例：密钥在发送那一刻由 adapter 的密钥解析路径取好放进
  * `request.headers`，本 transport 只透传，自己不持有任何密钥、也不读 env。
  */
 export const httpTransport: ProviderTransport = {
@@ -32,6 +32,7 @@ export const httpTransport: ProviderTransport = {
         headers: { ...request.headers },
         body: JSON.stringify(request.body),
         signal: request.signal,
+        redirect: request.redirect ?? "follow",
       });
     } catch (cause) {
       // 超时/调用方取消：signal 已 aborted，原样抛出，交给 makeSendWithGuards 分类。

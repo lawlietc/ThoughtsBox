@@ -8,7 +8,7 @@ import type { RecordRowView } from "./projections.ts";
  */
 
 /** 选中行的底色，与原型同一表达式（不是新发明的视觉语言）。 */
-const SELECTED_BACKGROUND = "color-mix(in srgb, canvastext 8%, transparent)";
+export const SELECTED_BACKGROUND = "color-mix(in srgb, canvastext 8%, transparent)";
 
 export interface RecordListProps {
   readonly rows: readonly RecordRowView[];

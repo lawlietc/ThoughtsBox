@@ -86,7 +86,6 @@ export function SearchPanel(props: SearchPanelProps): React.ReactNode {
             </button>
           )}
         </div>
-        {!active && <p className="hint">输入一个词，搜索你写过的内容。</p>}
         {/* 筛选条只列现在可用的层；未就绪的层不画 —— 界面不为做不到的事摆位置。 */}
         <div className="actions filterbar">
           {SEARCH_LAYERS.filter((layer) => layer.ready).map((layer) => (

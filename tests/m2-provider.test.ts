@@ -34,6 +34,7 @@ import {
   type StructuredOutput,
 } from "../src/server/ingest/contract.ts";
 import { InvalidJsonError, canExtractJson, extractJson } from "../src/server/ingest/extractJson.ts";
+import { axesForProcessingMode, type ThreeAxes } from "../src/shared/contracts/enums.ts";
 import {
   ERROR_RETRYABILITY,
   PARSE_ERROR_KINDS,
@@ -139,6 +140,7 @@ function validOutput(): StructuredOutput {
     emotions: [{ labelSaid: "焦虑", candidateConceptId: seedConceptId("焦虑"), basis: "explicit", evidence: "我感到焦虑" }],
     topics: [{ labelSaid: "工作", candidateConceptId: seedConceptId("工作与职场"), basis: "explicit", evidence: "讨论了发布计划" }],
     entities: [{ labelSaid: "项目组", candidateConceptId: null, basis: "explicit", evidence: "和项目组的同事" }],
+    relations: [],
   };
 }
 
@@ -152,6 +154,7 @@ function validCloudOutput(): StructuredOutput {
     emotions: [{ labelSaid: "开心", candidateConceptId: seedConceptId("开心"), basis: "explicit", evidence: "聊了三个小时" }],
     topics: [{ labelSaid: "社交", candidateConceptId: seedConceptId("朋友与社交"), basis: "explicit", evidence: `和${PH_PERSON}去了` }],
     entities: [{ labelSaid: "张三", candidateConceptId: null, basis: "explicit", evidence: `和${PH_PERSON}` }],
+    relations: [],
   };
 }
 
@@ -235,14 +238,18 @@ function makeAdapter(over: {
 
 function makeRequest(over: {
   readonly processingMode?: ProcessingMode;
+  readonly axes?: ThreeAxes;
   readonly payloadText?: string;
   readonly recordRevisionId?: string;
   readonly redactionMap?: JsonValue;
   readonly signal?: AbortSignal;
 } = {}): ExtractionRequest {
+  const processingMode = over.processingMode ?? "local_model";
   return {
     recordRevisionId: over.recordRevisionId ?? "rev_fixture_1",
-    processingMode: over.processingMode ?? "local_model",
+    // 三轴是判定源（草案 §二），派生模式只是兼容字段：夹具从模式反推，保持既有各行语义不变。
+    axes: over.axes ?? axesForProcessingMode(processingMode),
+    processingMode,
     payloadText: over.payloadText ?? LOCAL_RAW,
     systemPrompt: "你是提取器，只输出 JSON。",
     promptVersion: "m2-prompt-v1",
@@ -397,6 +404,7 @@ describe("ADR-006 结构门：形状不合只由它拒，错误类型固定 prov
       emotions: [],
       topics: [],
       entities: [],
+      relations: [],
     };
     const result = validateBusiness(parseStructuredOutput(empty), localContext());
     expect([result.episodes, result.thoughts, result.emotions, result.topics, result.entities].map((list) => list.length)).toEqual([0, 0, 0, 0, 0]);

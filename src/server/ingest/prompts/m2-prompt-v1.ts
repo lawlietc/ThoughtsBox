@@ -6,8 +6,11 @@
  * `contract.ts` 的 `m2-output-v1` 输出契约撰写——字段名、枚举封闭集、以及「证据必须逐字摘自
  * 原文、不得编造坐标/概念」等硬要求都写进指令正文。
  *
- * **版本串沿用 `m2-prompt-v1` 不升**（`ingestService.ts:73` 的 `DEFAULT_PROMPT_VERSION`）：
+ * **版本串沿用 `m2-prompt-v1` 不升**（当时 `ingestService.ts` 的 `DEFAULT_PROMPT_VERSION`）：
  * 升版本 = 动 pipeline_manifest 的 `prompt` 项 = 动 K-17 指纹与幂等语义，超出本任务范围。
+ * 〔M7-2 追记〕默认串已随输出契约的 `relations` 键升到 `m2-prompt-v2` / `m2-output-v2`，
+ * 生产装配（`runtime/productionProvider.ts`）改用 `M2_PROMPT_V2`。本文件保留为 v1 管线的
+ * 历史原文——旧 run 的 manifest 里记的就是它，改写字面等于伪造历史。
  *
  * 枚举取值一律从 `contracts` 单一事实源插入，不在文本里手抄第二份封闭集（E-07，与
  * `contract.ts`、`trace.ts` 同法）；「提示词 ↔ contract 字段表对账」断言见新专项测试。

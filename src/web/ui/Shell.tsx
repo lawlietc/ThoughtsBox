@@ -17,13 +17,17 @@
  *
  * 4. **主题归外壳，不归任何一页。** 深浅两套光线是全局的事，挂在 `<html data-theme>` 上；
  *    开关放在标题栏右侧，与沟通件自己的入口（`headerAside`）同一位。
+ *
+ * 5. **提示位只有一个，而且在滚动区之外**（〔web-redesign 批 2 · 事项 I〕）。原先它画在
+ *    `.app-main` 里面 —— 宽屏那一栏是唯一滚动容器，正文一长，「整理失败」那句就被滚上去看不见；
+ *    现在它是 `.app-body` 的兄弟，标题与提示之间，谁都不会把它顶出屏外。
  */
 
 import { useEffect, useRef } from "react";
 import { Box as BoxIcon, Ellipsis, SunMedium } from "lucide-react";
 
-import { Prose } from "./bits.tsx";
 import { BOX_SUB_TABS, STANDALONE, TABS, TODAY_TABS, tabOf } from "./nav.ts";
+import { NoticeBar } from "./Notice.tsx";
 import { ThemeToggle } from "./ThemeToggle.tsx";
 import type { ShellProps, TabKey, ViewKey } from "./types.ts";
 
@@ -43,7 +47,7 @@ const TAB_ICONS: Record<TabKey, typeof SunMedium> = {
 };
 
 export function Shell(props: ShellProps): React.ReactNode {
-  const { view, onNavigate, badges, notice } = props;
+  const { view, onNavigate, badges, notices } = props;
   const tab = tabOf(view);
   const standalone = STANDALONE.includes(view);
   const mainRef = useRef<HTMLDivElement>(null);
@@ -81,6 +85,9 @@ export function Shell(props: ShellProps): React.ReactNode {
       </header>
 
       {props.banner}
+
+      {/* 提示位：滚动区之外，全站唯一。谁 push、几秒撤，是 `useNotices` 与调用方的事。 */}
+      <NoticeBar notices={notices ?? []} onDismiss={props.onDismissNotice ?? (() => {})} />
 
       <div className="app-body">
         {/* 同一份 tab，窄屏在底部、宽屏在左侧 —— 位置交给 CSS，不用 JS 判断。 */}
@@ -132,17 +139,12 @@ export function Shell(props: ShellProps): React.ReactNode {
             </nav>
           )}
 
-          {/* 不在标签栏里的页面得自带「回去」的动作。 */}
+          {/* 不在标签栏里的页面得自带「回去」的动作。去哪一页由调用方说（默认「今天」）：
+              编辑页要回到它正在编辑的那一条记录，回首页等于把刚编的那条丢了。 */}
           {standalone && (
-            <button className="btn" onClick={() => onNavigate("today")}>
-              ← 返回今天
+            <button className="btn" onClick={() => onNavigate(props.backTo ?? "today")}>
+              {props.backLabel ?? "← 返回今天"}
             </button>
-          )}
-
-          {notice !== null && notice !== undefined && (
-            <p className="flash">
-              <Prose text={notice} />
-            </p>
           )}
 
           {props.children}

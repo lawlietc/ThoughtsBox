@@ -267,6 +267,7 @@ describe("§7.6 单条回锚：定位 → 映射 → 逐字核验", () => {
           originalEnd: CLOUD_RAW.length + 40,
           redactedStart,
           redactedEnd: redactedStart + PH_PERSON.length,
+          source: "rule" as const,
         },
       ],
     };

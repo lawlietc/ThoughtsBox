@@ -3,19 +3,18 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ApiError } from "../src/web/apiClient.ts";
-import type { IngestResultDto } from "../src/shared/dto.ts";
-import { quickOrganizeBusyLabel, quickSecondActionFor, runQuickSave, type QuickSaveDeps } from "../src/web/quickSave.ts";
+import { quickSecondActionFor, runQuickSave, type QuickSaveDeps } from "../src/web/quickSave.ts";
 import { processingModeChoices } from "../src/web/projectionPort.ts";
 
 /**
- * M5-2：QuickPanel「保存并整理」——按处理模式分派的保存动作。
+ * M5-2 →「整理方式改动」：QuickPanel 第二动作 = 「保存并整理」= 排进后台队列。
  *
  * 时序与文案的钉法分两面：
  * - **动态面**：`runQuickSave` 是与 React 无关的驱动函数，测试注入记账假件，
- *   能真正执行「createRecord 成功 → onCreated（清空输入）→ onSaved → ingestParse → onSaved」
- *   这条链，并证伪「创建失败还去 parse」「onCreated 晚于 ingestParse（整理数十秒才清空）」「云端擅自 parse/preview/confirm-send」。
- * - **静态面**：按钮渲染条件、忙碌文案、`setText("")` 绑在 onCreated 而非 outcome 之后、
- *   App 的 `onOpenPending` 接线，沿用本仓 UI 测试既有的源码断言（vitest 是 node 环境，没有 DOM）。
+ *   能真正执行「createRecord 成功 → onCreated（清空输入）→ onSaved → enqueueJob → onQueued」
+ *   这条链，并证伪「创建失败还去入队」「入队失败却仍然离开这一页」「快速页擅自 parse/preview/confirm-send」。
+ * - **静态面**：按钮渲染条件与颜色、忙碌文案、`setText("")` 绑在 onCreated 而非 outcome 之后、
+ *   App 的 `notify` + 来路页接线，沿用本仓 UI 测试既有的源码断言（vitest 是 node 环境，没有 DOM）。
  */
 
 const WEB = join(process.cwd(), "src", "web");
@@ -33,7 +32,7 @@ interface Harness {
 
 function harness(options: {
   create?: (text: string, mode: string) => Promise<{ record: { id: string } }>;
-  parse?: (body: { recordId: string }) => Promise<IngestResultDto>;
+  enqueue?: (recordId: string) => Promise<unknown>;
 } = {}): Harness {
   const calls: string[] = [];
   const deps: QuickSaveDeps = {
@@ -41,9 +40,9 @@ function harness(options: {
       calls.push(`createRecord:${mode}`);
       return { record: { id: `rec_new_${calls.length}` } };
     }),
-    ingestParse: options.parse ?? (async ({ recordId }) => {
-      calls.push(`ingestParse:${recordId}`);
-      return parseResult({ succeeded: true });
+    enqueueJob: options.enqueue ?? (async (recordId) => {
+      calls.push(`enqueueJob:${recordId}`);
+      return { id: "job_test_1" };
     }),
     onCreated: (recordId) => {
       calls.push(`onCreated:${recordId}`);
@@ -51,62 +50,32 @@ function harness(options: {
     onSaved: () => {
       calls.push("onSaved");
     },
-    onOpenPending: (recordId) => {
-      calls.push(`onOpenPending:${recordId}`);
+    onQueued: (recordId) => {
+      calls.push(`onQueued:${recordId}`);
     },
   };
   return { calls, deps };
 }
 
-function parseResult(overrides: Partial<IngestResultDto>): IngestResultDto {
-  return {
-    runId: "run_test_1",
-    idempotencyKey: "key_test",
-    pipelineFingerprint: "fp_test",
-    processingMode: "local_model",
-    succeeded: true,
-    replayed: false,
-    recovered: false,
-    provider: "测试",
-    model: "测试",
-    callPath: "local",
-    attemptedPaths: [],
-    degraded: false,
-    errorKind: null,
-    writes: {
-      episodes: 0,
-      thoughts: 0,
-      mentions: 0,
-      rejectedMentions: 0,
-      suggestions: 0,
-      evidenceRepairs: 0,
-      deduplicated: 0,
-      unrouted: 0,
-      unresolvedEntities: 0,
-    },
-    title: "测试标题",
-    summary: "测试摘要",
-    failure: null,
-    ...overrides,
-  };
-}
+/* ── A. 四档的第二动作（纯函数） ────────────────────────────────── */
 
-/* ── A. 三模式的第二动作选择（纯函数） ──────────────────────────── */
-
-describe("M5-2 · 三模式动作选择", () => {
-  it("manual_only 没有第二按钮；local/cloud 各有一个，标签逐字来自任务书", () => {
+describe("整理方式 · 四档的第二动作", () => {
+  it("manual_only 没有第二按钮；另三档同一颗「保存并整理」，kind 一律是入队", () => {
     expect(quickSecondActionFor("manual_only")).toBeNull();
-    expect(quickSecondActionFor("local_model")?.label).toBe("保存并整理");
-    expect(quickSecondActionFor("cloud_redacted")?.label).toBe("保存，去确认发送");
-    expect(quickSecondActionFor("local_model")?.kind).toBe("organize-local");
-    expect(quickSecondActionFor("cloud_redacted")?.kind).toBe("go-pending");
+    for (const mode of ["local_model", "cloud_redacted", "cloud_raw"]) {
+      expect(quickSecondActionFor(mode)?.label, mode).toBe("保存并整理");
+      expect(quickSecondActionFor(mode)?.kind, mode).toBe("enqueue");
+    }
+    // 从前云端两档那句「保存，去确认发送」不再存在：那一档现在也只负责排进队列。
+    expect(quickSecondActionFor("cloud_redacted")?.label).not.toBe("保存，去确认发送");
   });
 
-  it("选择器恰好覆盖 enums 三档，档位外取值不给按钮（不摆能点却不该做的事）", () => {
+  it("选择器恰好覆盖 enums 四档，档位外取值不给按钮（不摆能点却不该做的事）", () => {
     expect(processingModeChoices().map((choice) => choice.key)).toEqual([
       "manual_only",
       "local_model",
       "cloud_redacted",
+      "cloud_raw",
     ]);
     for (const choice of processingModeChoices()) {
       const action = quickSecondActionFor(choice.key);
@@ -115,55 +84,34 @@ describe("M5-2 · 三模式动作选择", () => {
     expect(quickSecondActionFor("cloud_direct")).toBeNull();
     expect(quickSecondActionFor("")).toBeNull();
   });
-
-  it("忙碌文案按模式区分：local 整理=「整理中…」，cloud 只是导航不得谎称整理", () => {
-    expect(quickOrganizeBusyLabel("local_model")).toBe("整理中…");
-    expect(quickOrganizeBusyLabel("cloud_redacted")).not.toBe("整理中…");
-    expect(quickOrganizeBusyLabel("cloud_redacted")).toBe("正在打开…");
-  });
 });
 
-/* ── B. local_model：保存并整理的时序 ───────────────────────────── */
+/* ── B. 三档入队时序：成功 / 创建失败 / 入队失败 ─────────────────── */
 
-describe("M5-2 · local：createRecord 必先于 ingestParse", () => {
-  it("成功路径：createRecord → onCreated → onSaved → ingestParse(recordId) → onSaved，onCreated 严格早于 parse", async () => {
-    const h = harness();
-    const outcome = await runQuickSave(h.deps, "周末想去爬山", "local_model", true);
-    expect(h.calls).toEqual([
-      "createRecord:local_model",
-      "onCreated:rec_new_1",
-      "onSaved",
-      "ingestParse:rec_new_1",
-      "onSaved",
-    ]);
-    expect(outcome.kind).toBe("saved");
-    expect(outcome.kind === "saved" && outcome.flash).toContain("原文已保存");
-  });
-
-  it("输入清空早于整理返回：parse 挂起数十秒时 onCreated 已在 createRecord 成功当刻触发", async () => {
-    const h = harness();
-    let releaseParse: () => void = () => {};
-    const gate = new Promise<void>((resolve) => {
-      releaseParse = () => resolve();
+describe("整理方式 · 保存并整理 = createRecord 必先于入队", () => {
+  for (const mode of ["local_model", "cloud_redacted", "cloud_raw"]) {
+    it(`${mode}：createRecord → onCreated → onSaved → enqueueJob(recordId) → onQueued，且回执说「已保存并进入整理队列」`, async () => {
+      const h = harness();
+      const outcome = await runQuickSave(h.deps, "周末想去爬山", mode, true);
+      expect(h.calls, mode).toEqual([
+        `createRecord:${mode}`,
+        "onCreated:rec_new_1",
+        "onSaved",
+        "enqueueJob:rec_new_1",
+        "onQueued:rec_new_1",
+      ]);
+      expect(outcome.kind, mode).toBe("saved-queued");
     });
-    h.deps.ingestParse = async ({ recordId }) => {
-      h.calls.push(`ingestParse:start:${recordId}`);
-      await gate; // 模拟本机模型整理持续数十秒
-      h.calls.push("ingestParse:resolved");
-      return parseResult({ succeeded: true });
-    };
-    const pending = runQuickSave(h.deps, "慢慢整理", "local_model", true);
-    // 冲刷 createRecord→onCreated→onSaved→ingestParse:start 这条微任务链（parse 仍卡在 gate 上）。
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    // 关键：此刻 parse 尚未返回，但清空输入的 onCreated 已经发生——「保存成功即清空」不靠整理结束。
-    expect(h.calls).toEqual(["createRecord:local_model", "onCreated:rec_new_1", "onSaved", "ingestParse:start:rec_new_1"]);
-    expect(h.calls).not.toContain("ingestParse:resolved");
-    releaseParse();
-    await pending;
-    expect(h.calls).toContain("ingestParse:resolved");
-  });
 
-  it("createRecord 抛 ApiError：绝不 parse、不刷徽章，detail 逐字如实呈现", async () => {
+    it(`${mode}：「只保存」那颗键绝不入队`, async () => {
+      const h = harness();
+      const outcome = await runQuickSave(h.deps, "只想存下来", mode, false);
+      expect(h.calls, mode).toEqual([`createRecord:${mode}`, "onCreated:rec_new_1", "onSaved"]);
+      expect(outcome.kind, mode).toBe("saved");
+    });
+  }
+
+  it("createRecord 抛 ApiError：绝不入队、不刷徽章，detail 逐字如实呈现", async () => {
     const h = harness({
       create: async () => {
         h.calls.push("createRecord:fail");
@@ -178,94 +126,42 @@ describe("M5-2 · local：createRecord 必先于 ingestParse", () => {
     expect(outcome.kind === "create-failed" && outcome.detail).toBe("text 不能为空或仅空白");
   });
 
-  it("parse 返回 succeeded:false：文案先说「原文已保存」，再带真实 failure.message 与 errorKind", async () => {
+  it("入队抛 503 ingest_unavailable：留在本页报错，原文已保存先讲，技术详情不丢", async () => {
     const h = harness({
-      parse: async ({ recordId }) => {
-        h.calls.push(`ingestParse:${recordId}`);
-        return parseResult({
-          succeeded: false,
-          errorKind: "provider_unavailable",
-          failure: {
-            errorKind: "provider_unavailable",
-            retryable: false,
-            message: "本机模型没在运行",
-            issues: [],
-          },
-        });
+      enqueue: async (recordId) => {
+        h.calls.push(`enqueueJob:${recordId}`);
+        throw new ApiError(503, "ingest_unavailable", "解析能力未就绪：Provider 面未装配。", []);
       },
     });
-    const outcome = await runQuickSave(h.deps, "试试本机整理", "local_model", true);
+    const outcome = await runQuickSave(h.deps, "试试整理", "local_model", true);
     expect(outcome.kind).toBe("saved-organize-failed");
     const warn = outcome.kind === "saved-organize-failed" ? outcome.warn : "";
+    const technical = outcome.kind === "saved-organize-failed" ? outcome.technical : null;
     expect(warn).toContain("原文已保存");
-    expect(warn).toContain("本机模型没在运行");
-    expect(warn).toContain("provider_unavailable");
-    // 徽章刷新：创建成功一次、parse 结束（失败也是结束）再一次。
-    expect(h.calls.filter((c) => c === "onSaved")).toHaveLength(2);
-  });
-
-  it("parse 抛 ApiError：仍是「原文已保存 + 真实 detail」，保存不被说成失败", async () => {
-    const h = harness({
-      parse: async ({ recordId }) => {
-        h.calls.push(`ingestParse:${recordId}`);
-        throw new ApiError(503, "service_unavailable", "本地模型服务不可达", []);
-      },
-    });
-    const outcome = await runQuickSave(h.deps, "云端在时本机挂了", "local_model", true);
-    expect(outcome.kind).toBe("saved-organize-failed");
-    const warn = outcome.kind === "saved-organize-failed" ? outcome.warn : "";
-    expect(warn).toContain("原文已保存");
-    expect(warn).toContain("本地模型服务不可达");
     expect(warn).not.toContain("保存失败");
-    expect(h.calls.filter((c) => c === "onSaved")).toHaveLength(2);
+    expect(technical).toContain("HTTP 503");
+    expect(technical).toContain("ingest_unavailable");
+    // 队列没收下这一行 ⇒ 那句「已保存并进入整理队列」与跳转都不许发生。
+    expect(h.calls).not.toContain("onQueued:rec_new_1");
   });
 
-  it("「只保存」按钮即使在 local 档位也不碰 parse", async () => {
-    const h = harness();
-    await runQuickSave(h.deps, "只想存下来", "local_model", false);
-    expect(h.calls).toEqual(["createRecord:local_model", "onCreated:rec_new_1", "onSaved"]);
-  });
-});
-
-/* ── C. cloud_redacted：只保存、只导航，绝不越权 ─────────────────── */
-
-describe("M5-2 · cloud：保存后去「待整理」，不自动 parse / preview / confirm-send", () => {
-  it("时序：createRecord → onCreated（清空）→ onSaved → onOpenPending(recordId)；parse 一次都不被调用", async () => {
+  it("入队抛非 ApiError：仍算「原文已保存 + 入队没成」，不冒泡成未处理异常", async () => {
     const h = harness({
-      create: async (_text, mode) => {
-        h.calls.push(`createRecord:${mode}`);
-        return { record: { id: "rec_cloud_1" } };
-      },
-      parse: async ({ recordId }) => {
-        h.calls.push(`ingestParse:BANNED:${recordId}`);
-        return parseResult({ succeeded: true });
+      enqueue: async () => {
+        throw new Error("前端网络层断了");
       },
     });
-    const outcome = await runQuickSave(h.deps, "这条想送云端但先要确认", "cloud_redacted", true);
-    expect(h.calls).toEqual([
-      "createRecord:cloud_redacted",
-      "onCreated:rec_cloud_1",
-      "onSaved",
-      "onOpenPending:rec_cloud_1",
-    ]);
-    expect(outcome.kind).toBe("saved");
-    const flash = outcome.kind === "saved" ? outcome.flash : "";
-    expect(flash).toContain("原文已保存");
-    expect(flash).toContain("待整理");
-    expect(flash).toContain("逐次确认");
-  });
-
-  it("源码层再钉一遍：QuickPanel 不存在 preview / confirm-send / reparse 的调用点", () => {
-    const text = source("QuickPanel.tsx");
-    expect(text).toMatch(/\bapi\.ingestParse\b/);
-    expect(text).not.toMatch(/\bapi\.ingest(Reparse|Preview|ConfirmSend)\b/);
+    const outcome = await runQuickSave(h.deps, "离线时点整理", "cloud_raw", true);
+    expect(outcome.kind).toBe("saved-organize-failed");
+    const technical = outcome.kind === "saved-organize-failed" ? outcome.technical : null;
+    expect(technical).toContain("前端网络层断了");
   });
 });
 
-/* ── D. manual_only：绝不调用模型 ───────────────────────────────── */
+/* ── C. manual_only：绝不调用模型，也绝不入队 ───────────────────── */
 
-describe("M5-2 · manual_only：存完就停", () => {
-  it("无论 organize 与否都不 parse、不导航", async () => {
+describe("整理方式 · manual_only：存完就停", () => {
+  it("无论 organize 与否都不入队、不提示入队", async () => {
     for (const organize of [false, true]) {
       const h = harness();
       const outcome = await runQuickSave(h.deps, "写点私事", "manual_only", organize);
@@ -275,23 +171,33 @@ describe("M5-2 · manual_only：存完就停", () => {
   });
 });
 
-/* ── E. 界面契约（静态源码面） ───────────────────────────────────── */
+/* ── D. 界面契约（静态源码面） ───────────────────────────────────── */
 
-describe("M5-2 · QuickPanel/App 的界面接线", () => {
+describe("整理方式 · QuickPanel/App 的界面接线", () => {
   const quick = source("QuickPanel.tsx");
   const app = source("App.tsx");
 
-  it("第二按钮按模式条件渲染，标签逐字来自选择器", () => {
+  it("第二按钮按模式条件渲染，标签取自 `quickSave`（旧的两句话在两处都不再出现）", () => {
     expect(quick).toContain("quickSecondActionFor(mode)");
     expect(quick).toMatch(/second !== null && \(/);
-    expect(quick).toContain("保存并整理");
-    expect(quick).toContain("保存，去确认发送");
+    expect(quick).toContain("second.label");
+    const driver = source("quickSave.ts");
+    expect(driver).toContain("保存并整理");
+    // 注释里留着「从前那句是什么」是给后来人看的；这里要钉的是它不再是**文案**。
+    expect(driver.replace(/\/\*[\s\S]*?\*\//g, "")).not.toContain("保存，去确认发送");
+    expect(quick).not.toContain("quickOrganizeBusyLabel");
   });
 
-  it("忙碌态：local 整理经 quickOrganizeBusyLabel(mode)，保存显示「保存中…」，两按钮互斥禁用防重复提交", () => {
-    expect(quick).toContain("quickOrganizeBusyLabel(mode)");
-    // 旧偏差：organize 一律硬映射成「整理中…」——云端只是导航，那不是整理，撒谎。现在不得再出现。
+  it("颜色互换：manual_only 的「只保存」才是绿色；有第二动作时「只保存」是白色、「保存并整理」绿色", () => {
+    expect(quick).toMatch(/className=\{second === null \? "btn primary" : "btn"\}/);
+    // 第二颗键无条件 primary（`manual_only` 时它压根不渲染）。
+    expect(quick).toMatch(/second !== null && \(\s*<button\s+className="btn primary"/);
+  });
+
+  it("忙碌态：入队用「排队中…」（不谎称已在整理），保存用「保存中…」，两按钮互斥禁用防重复提交", () => {
+    expect(quick).toMatch(/busy === "organize" \? "排队中…"/);
     expect(quick).not.toMatch(/busy === "organize" \? "整理中…"/);
+    expect(quick).not.toContain("正在打开…");
     expect(quick).toContain('busy === "save" ? "保存中…"');
     expect(quick).toContain("if (busy !== null) return;");
     const disabledCount = [...quick.matchAll(/disabled=\{busy !== null/g)].length;
@@ -299,16 +205,23 @@ describe("M5-2 · QuickPanel/App 的界面接线", () => {
   });
 
   it("保存成功即清空：setText(\"\") 绑在 createRecord 当刻的 onCreated，而非 runQuickSave 返回之后", () => {
-    // 即时清空挂在 onCreated 上（createRecord 成功当刻触发）。
-    expect(quick).toMatch(/onCreated:\s*\(\)\s*=>\s*setText\(""\)/);
-    // 旧偏差＝整段 runQuickSave 返回后才 setText("")（local 整理可达数十秒），违反 §一.2——必须已消失。
+    expect(quick).toMatch(/onCreated:\s*\(recordId\)\s*=>\s*\{[^}]*setText\(""\)[^}]*\}/);
+    // 旧偏差＝整段 runQuickSave 返回后才 setText("")，违反「保存成功即清空」——必须已消失。
     expect(quick).not.toMatch(/return;\s*\}\s*setText\(""\)/);
     expect(quick.indexOf("onCreated")).toBeLessThan(quick.indexOf("await runQuickSave"));
     // 创建失败：如实报错并 return，既不进入 flash，也从不触发清空（原文留给用户）。
     expect(quick).toMatch(/if \(outcome\.kind === "create-failed"\) \{\s*setError\(outcome\.detail\);\s*return;\s*\}/);
   });
 
-  it("Props 增 onOpenPending(recordId)，且 App 接到 setSelectedId + 切 ingest 页", () => {
+  it("入队当刻的回执走全局提示位并离开本页：notify({tone:\"ok\"}) + onReturnToPrevious 都在 onQueued 里", () => {
+    expect(quick).toMatch(
+      /onQueued:[^=]*=>\s*\{\s*props\.notify\(\{ tone: "ok", message: "已保存并进入整理队列。" \}\);\s*props\.onReturnToPrevious\(\);/,
+    );
+    expect(quick).toMatch(/notify:\s*\(input: NoticeInput\) => void/);
+    expect(quick).toMatch(/onReturnToPrevious:\s*\(\) => void/);
+  });
+
+  it("Props 仍留 onOpenPending（那是「没有本机模型」那句引导的入口），App 接到 setSelectedId + 切 ingest 页", () => {
     expect(quick).toMatch(/onOpenPending:\s*\(recordId: string\) => void/);
     const branch = /<QuickPanel[\s\S]*?\/>/.exec(app)?.[0] ?? "";
     expect(branch, "App 的 QuickPanel 分支要被断言到").not.toBe("");
@@ -318,12 +231,28 @@ describe("M5-2 · QuickPanel/App 的界面接线", () => {
     expect(branch).toContain("onSaved={refreshBadges}");
   });
 
+  it("来路由 App 记（不是固定回「今天」）：记上一个非 quick 页 + 走 leaveWithoutGuard", () => {
+    expect(app).toMatch(/const \[quickReturn, setQuickReturn\] = useState<ViewKey>\("today"\);/);
+    expect(app).toMatch(/if \(view !== "quick"\) setQuickReturn\(view\);/);
+    expect(app).toMatch(/returnFromQuick[\s\S]{0,120}leaveWithoutGuard\(quickReturn\)/);
+    const branch = /<QuickPanel[\s\S]*?\/>/.exec(app)?.[0] ?? "";
+    expect(branch).toContain("notify={push}");
+    expect(branch).toContain("onReturnToPrevious={returnFromQuick}");
+  });
+
+  it("快速页一个越权动作都不发：不 parse、不 preview、不 confirm-send、不 reparse", () => {
+    // 从前 local_model 走同步 `api.ingestParse`；改成入队后这一页对模型的调用点应为零。
+    expect(quick).not.toMatch(/\bapi\.ingestParse\b/);
+    expect(quick).not.toMatch(/\bapi\.ingest(Reparse|Preview|ConfirmSend)\b/);
+    expect(quick).toMatch(/\bapi\.enqueueJob\b/);
+  });
+
   it("短标签说明模式去向，长解释不占主界面；行为边界仍由 quickSave 时序测试钉死", () => {
     const picker = source("ui/ProcessingModePicker.tsx");
     expect(quick).toContain("<ProcessingModePicker");
     expect(picker).toContain("整理方式：");
     expect(picker).toContain("先保存，需要时在本机整理");
-    expect(picker).toContain("保存后去确认发送");
+    expect(picker).toContain("本地模型处理脱敏，发送云端模型整理");
     expect(quick).not.toContain("MODE_ACTION_NOTE");
   });
 });

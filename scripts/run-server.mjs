@@ -51,9 +51,9 @@ const env = { ...process.env };
 if (value !== undefined) {
   env[KEY_ENV] = value;
   // 只报「已注入」这一布尔事实，永不 echo 值、不报文件内容。
-  process.stdout.write("已从密钥文件注入 " + KEY_ENV + "（值不显示）。\n");
+  process.stdout.write("已从密钥文件提供模型密钥（值不显示）。\n");
 } else {
-  process.stdout.write("未提供密钥（密钥文件缺失或为空）：" + KEY_ENV + " 不注入，按未配置启动。\n");
+  process.stdout.write("未提供模型密钥（可选）：可按无密钥启动，也可稍后在设置页填写。\n");
 }
 
 const child = spawn(process.execPath, [serverEntry], {

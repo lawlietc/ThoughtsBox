@@ -58,8 +58,11 @@ describe("ui/nav —— 导航结构", () => {
     expect(BOX_SUB_TABS).toEqual([...BOX_TABS, { key: "search", label: "搜索" }]);
   });
 
-  it("不进标签栏的是那两个动作与沟通件自己的目录页", () => {
-    expect(STANDALONE).toEqual(["quick", "sleep", "overview"]);
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批4-编辑独立页与保存确认.md〕
+  // 批 4 按方案 C 把 `edit`（编辑原文）加进这一族：写是独占动作，与 quick / sleep 同待遇。
+  // 判据没有放宽——仍是逐字相等，只是把「这一族有谁」更新成裁定后的结构。
+  it("不进标签栏的是三个动作与沟通件自己的目录页", () => {
+    expect(STANDALONE).toEqual(["quick", "sleep", "edit", "overview"]);
   });
 
   it("每个 tab 的落地页都归属在这个 tab 自己下面", () => {
@@ -81,6 +84,8 @@ describe("ui/nav —— 导航结构", () => {
       ["ingest", "today"],
       ["suggestions", "today"],
       ["sleep", "today"],
+      // 编辑原文（批 4 · C）：从「全部记录 / 待整理」的详情进去，仍挂在今天这条线上。
+      ["edit", "today"],
       ["emotions", "boxes"],
       ["episodes", "boxes"],
       ["thoughts", "boxes"],

@@ -66,7 +66,9 @@ export function TodayPanel(props: TodayPanelProps): React.ReactNode {
             今天的片段
             {todays.length > 0 && <span className="tag"> {todays.length}</span>}
           </h3>
-          <button className="link-btn" onClick={() => props.onNavigate("records")}>
+          {/* 〔web-redesign 批 7〕原来是一颗 `.link-btn`（40px 高的安静文字链接）。
+              那个类已经退场：全站触控统一走 `.btn`（44px），不再留一档半高不低的次级链接。 */}
+          <button className="btn" onClick={() => props.onNavigate("records")}>
             全部片段
           </button>
         </div>

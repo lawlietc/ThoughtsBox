@@ -3,6 +3,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { loadEnums } from "../../shared/contracts/load.ts";
 import type { Database } from "../db/adapter.ts";
 import type { JsonObject } from "./manifest.ts";
+import { findFormatCandidates, FORMAT_REDACTION_KINDS } from "./rules.ts";
+import { isEntityStopTerm } from "./entityStopTerms.ts";
 
 /**
  * 规则脱敏与原文↔脱敏文本的区间映射（M2-3 / D7）。
@@ -23,29 +25,82 @@ import type { JsonObject } from "./manifest.ts";
 /**
  * 脱敏策略版本：进 `cloud_send_grant.policy_version` 与 `pipeline_manifest.redaction`。
  * 策略字面量或规则集合任何改变都必须升版——K-17 的「策略变化即旧授权不适用」靠这个值成立。
+ *
+ * 升版判定只看**替换集合**：规则集合、实体匹配优先级、重叠消解规则、占位符格式，任一改变即升版。
+ * `RedactionSpan.source`（M6-0F）是**元数据**——它记录某一处是被哪一层遮的，不改变哪些区间被替换，
+ * 因此脱敏文本与 `payload_sha256` 逐字不变、加它不升版，存量 `cloud_send_grant` 继续有效（草案 §三）。
  */
-export const REDACTION_POLICY_VERSION = "rules-v1";
+export const REDACTION_POLICY_VERSION = "rules-v2";
 
 /**
- * 规则类占位符的取值集合。上游只枚举了「手机号、邮箱」（Spec §5.1.4 / §6.2），
- * 「等」没有清单，因此这里**不多做**一个规则类别——身份证、IP 之类若上游未点名，
- * 就不由实现方自行宣布为契约（宁可漏脱敏由用户确认兜住，也不静默扩大「已脱敏」的承诺面）。
+ * 本地模型辅助档的策略版本（M9-3 / 执行准则 §五）。
+ *
+ * 升版理由不是「多了一层来源标记」而是**替换集合真的变了**：LLM 候选会把规则与实体记忆
+ * 都没遮到的区间遮掉，同一原文的脱敏文本与 `payload_sha256` 随之不同。所以它与 `rules-v1`
+ * 互不命中，`rules-v1` 上签发的授权对本档不适用，反之亦然（K-17）。
  */
-export const RULE_REDACTION_KINDS = ["phone", "email"] as const;
+export const LOCAL_LLM_POLICY_VERSION = "rules+local_llm-v2";
+
+/**
+ * 原文发送授权的策略版本（M6-0D / 0D 草案 §三）：语义是「发送原文这一行为本身的契约版本」。
+ * 与 `REDACTION_POLICY_VERSION` 并列放在这里的理由：两条轨道靠 policy_version 互不命中，
+ * 就近摆放让「准备给规则集升版」的人一眼看到还有另一条轨道存在。
+ *
+ * 它**不随规则集变化**：原文发送不经过脱敏层，规则升版不该让既有的原文授权一起失效
+ * （那是语义错误，0D 草案 §四 的失效表）。只有「原文发送本身引入新的告知或确认步骤」时
+ * 才升到 `raw-v2`。
+ */
+export const RAW_SEND_POLICY_VERSION = "raw-v1";
+
+/**
+ * 规则类占位符的取值集合（L0，2026-11-04 升 v2）。
+ *
+ * 只收「与语言无关、按格式判定」的东西：手机号、邮箱、身份证号、银行卡号、密钥/token。
+ * 姓名/地名/机构名**不在这里**——那是 L2 本机模型的事。
+ * CDK/兑换码本轮不做（PD-7）；遇到时没有任何一层会遮它。
+ */
+export const RULE_REDACTION_KINDS = FORMAT_REDACTION_KINDS;
 export type RuleRedactionKind = (typeof RULE_REDACTION_KINDS)[number];
 
 /** 实体类占位符的 kind 直接取 enums.json 的封闭 `entity_types`，不另立名称。 */
 export const ENTITY_REDACTION_KINDS: readonly string[] = loadEnums().entity_types;
 
-/** 全部合法 kind：两个规则类别 + 七个实体类型（封闭集，`closed_set_rule`）。 */
+/**
+ * 语义层（L1 词表 + L2 本机模型）只产出这三类（2026-11-04 裁决）。
+ * `work` / `product` / `activity` / `event` / `other` 一律不遮；
+ * `entity_types` 的八值全集仍保留给旧 map 回读（`parseRedactionMap`）。
+ */
+export const SEMANTIC_REDACTION_KINDS = ["person", "place", "organization"] as const;
+export type SemanticRedactionKind = (typeof SEMANTIC_REDACTION_KINDS)[number];
+
+/** 全部合法 kind：五个规则类别 + 七个实体类型（封闭集，`closed_set_rule`）。 */
 export const REDACTION_KINDS: readonly string[] = [...RULE_REDACTION_KINDS, ...ENTITY_REDACTION_KINDS];
 
 export function isRedactionKind(value: string): boolean {
   return REDACTION_KINDS.includes(value);
 }
 
-const PHONE_PATTERN = /(?<!\d)1[3-9]\d{9}(?!\d)/g;
-const EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
+/**
+ * 一处遮蔽的**来源层**（M6-0F / 草案 §二，4 值封闭集）。
+ *
+ * 取值域留在本文件、与 `REDACTION_KINDS` 同级，**不进 `enums.json`**（草案 §四末条）：
+ * `enumFileSchema` 是 `.strict()`，新增顶层键会被拒；一旦塞进 enums，本次改动就从
+ * 「加元数据」升级为「改枚举契约」，性质变了。
+ *
+ * - `rule`：手机号 / 邮箱正则，与具体用户无关。
+ * - `entity_memory`：`collectKnownEntities()` 命中的本机实体/别名记忆，**包括**此前
+ *   「以后也隐藏」落下的 provisional 实体——它们同样走 entity 通道。
+ * - `local_llm`：本地模型辅助脱敏（M9-3 起由 `extraCandidates` 产出，M9-4c 接进 op6 预览）。
+ * - `user_confirmed`：**占位值，本阶段不产出**。由阶段 1 预览里的「逐处标记」交互产出，
+ *   与 `entity_memory` 的区别是「只对这一次」还是「已持久化」。
+ */
+export const REDACTION_SOURCES = ["rule", "entity_memory", "local_llm", "user_confirmed"] as const;
+export type RedactionSource = (typeof REDACTION_SOURCES)[number];
+
+/** 入参按 `unknown`：来源值的真实出处是库里的 manifest 文本，编译期形状不作数。 */
+export function isRedactionSource(value: unknown): value is RedactionSource {
+  return typeof value === "string" && (REDACTION_SOURCES as readonly string[]).includes(value);
+}
 
 /** 单次请求占位符的一次性随机量：跨请求不稳定，避免关联暴露（Spec §6.2）。 */
 function newNonce(): string {
@@ -57,6 +112,11 @@ export interface KnownEntity {
   readonly entityType: string;
   /** 该实体在原文中可能被写出的全部字面形式：标准名、展示名与别名（逐字，不做大小写折叠）。 */
   readonly terms: readonly string[];
+  /** 以下三项是可选的：测试夹具可以只给前三个字段，行为按「放行」处理（旧夹具兼容）。 */
+  readonly lifecycleStatus?: string;
+  readonly originType?: string;
+  /** 这个实体是否至少有一条 `entity_mention(status='active', basis='explicit')`。 */
+  readonly hasExplicitActiveMention?: boolean;
 }
 
 /**
@@ -70,6 +130,14 @@ export interface RedactionSpan {
   readonly originalEnd: number;
   readonly redactedStart: number;
   readonly redactedEnd: number;
+  /** 这一处是被哪一层遮的（元数据，不参与替换判定）。 */
+  readonly source: RedactionSource;
+  /**
+   * 词表来源（`source === "entity_memory"`）时，被命中的 `entity.id`。
+   * 只进预览投影供「从词表去掉」使用，**不写进 manifest 的映射本体**：坐标与占位符才是回锚所需，
+   * 实体 id 是管理面的事；不落盘也让旧映射的回读形状逐字不变。
+   */
+  readonly entityId?: string;
 }
 
 export interface RedactionMap {
@@ -88,9 +156,23 @@ export interface OriginalRange {
   readonly end: number;
 }
 
+/** 调用方提供的额外候选区间：坐标锚定同一份 `rawText` 的 UTF-16 偏移。 */
+export interface ExtraRedactionCandidate {
+  readonly start: number;
+  readonly end: number;
+  readonly kind: string;
+}
+
 export interface RedactionOptions {
   /** 注入随机量只为了测试可复现；生产路径每次都新生成。 */
   readonly nonce?: string;
+  /**
+   * 本地模型层产出的候选（M9-3）。来源固定记为 `local_llm`——本入参就是这一层的入口，
+   * 不接受调用方自报来源，免得把 `rule` 的优先级冒充出来。
+   */
+  readonly extraCandidates?: readonly ExtraRedactionCandidate[];
+  /** 本次替换集合所属的策略版本；缺省维持 `rules-v1`，逐字不变。 */
+  readonly policyVersion?: string;
 }
 
 /**
@@ -102,9 +184,15 @@ export function collectKnownEntities(db: Database): KnownEntity[] {
     .prepare(
       `select e.id as entity_id, e.entity_type as entity_type,
               e.canonical_name as canonical_name, e.display_name as display_name,
-              a.alias as alias
+              e.lifecycle_status as lifecycle_status, e.origin_type as origin_type,
+              a.alias as alias,
+              exists(
+                select 1 from entity_mention as m
+                 where m.entity_id = e.id and m.status = 'active' and m.basis = 'explicit'
+              ) as has_explicit
        from entity as e
        left join entity_alias as a on a.entity_id = e.id
+       where e.mask_enabled = 1
        order by e.id`,
     )
     .all() as unknown as Array<{
@@ -112,12 +200,30 @@ export function collectKnownEntities(db: Database): KnownEntity[] {
     entity_type: string;
     canonical_name: string;
     display_name: string;
+    lifecycle_status: string;
+    origin_type: string;
     alias: string | null;
+    has_explicit: number;
   }>;
 
-  const byEntity = new Map<string, { type: string; terms: Set<string> }>();
+  const byEntity = new Map<
+    string,
+    {
+      type: string;
+      lifecycleStatus: string;
+      originType: string;
+      hasExplicitActiveMention: boolean;
+      terms: Set<string>;
+    }
+  >();
   for (const row of rows) {
-    const bucket = byEntity.get(row.entity_id) ?? { type: row.entity_type, terms: new Set<string>() };
+    const bucket = byEntity.get(row.entity_id) ?? {
+      type: row.entity_type,
+      lifecycleStatus: row.lifecycle_status,
+      originType: row.origin_type,
+      hasExplicitActiveMention: row.has_explicit === 1,
+      terms: new Set<string>(),
+    };
     for (const term of [row.canonical_name, row.display_name, row.alias ?? ""]) {
       if (term !== "") bucket.terms.add(term);
     }
@@ -127,6 +233,9 @@ export function collectKnownEntities(db: Database): KnownEntity[] {
   return [...byEntity.entries()].map(([entityId, bucket]) => ({
     entityId,
     entityType: bucket.type,
+    lifecycleStatus: bucket.lifecycleStatus,
+    originType: bucket.originType,
+    hasExplicitActiveMention: bucket.hasExplicitActiveMention,
     terms: [...bucket.terms],
   }));
 }
@@ -137,17 +246,65 @@ interface Candidate {
   readonly dedupeKey: string;
   readonly start: number;
   readonly end: number;
+  /** 产出这条候选的那一层。重叠消解保留谁，来源就跟着谁走——来源是候选的属性，不是区间的属性。 */
+  readonly source: RedactionSource;
+  /** 仅 `entity_memory` 候选携带；随 span 进预览投影，供「从词表去掉」。 */
+  readonly entityId?: string;
 }
 
-function ruleCandidates(text: string, pattern: RegExp, kind: RuleRedactionKind): Candidate[] {
-  const found: Candidate[] = [];
-  for (const match of text.matchAll(pattern)) {
-    const value = match[0];
-    const start = match.index;
-    if (value === "" || start === undefined) continue;
-    found.push({ kind, dedupeKey: `${kind}\u0000${value}`, start, end: start + value.length });
+function ruleCandidates(text: string): Candidate[] {
+  return findFormatCandidates(text);
+}
+
+const ASCII_TERM = /^[\x00-\x7F]+$/;
+const WORD_CHAR = /[A-Za-z0-9_]/;
+
+/** G1 词形门：太短、纯数字、纯标点、黑名单词都不进自动遮。 */
+function termPassesWordForm(term: string): boolean {
+  const clean = term.trim();
+  if (clean.length < 2) return false;
+  if (/^\d+$/.test(clean)) return false;
+  if (!/[\p{L}\p{N}]/u.test(clean)) return false;
+  if (isEntityStopTerm(clean)) return false;
+  return true;
+}
+
+/**
+ * G2 边界门：拉丁/数字词面前后不能是 `[A-Za-z0-9_]`。
+ * CJK 没有词边界，靠长度与黑名单兜；两种词面都不做大小写折叠。
+ */
+function findTermOccurrences(text: string, term: string): number[] {
+  const out: number[] = [];
+  if (term === "") return out;
+  const needsBoundary = ASCII_TERM.test(term);
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf(term, from);
+    if (at < 0) break;
+    if (!needsBoundary) {
+      out.push(at);
+      from = at + term.length;
+      continue;
+    }
+    const before = at === 0 ? undefined : text[at - 1];
+    const after = text[at + term.length];
+    const leftOk = before === undefined || !WORD_CHAR.test(before);
+    const rightOk = after === undefined || !WORD_CHAR.test(after);
+    if (leftOk && rightOk) out.push(at);
+    from = at + 1;
   }
-  return found;
+  return out;
+}
+
+/**
+ * G4 来源/证据门：`user_created` 放行；`active`（用户转正过）放行；`archived` 放行；
+ * `ai_generated + provisional` 默认不放行，除非至少有一条 explicit 的活跃提及。
+ * 测试夹具只给前三个字段时（`originType` 缺席）按放行处理，保持旧夹具可用。
+ */
+function entityPassesSourceGate(entity: KnownEntity): boolean {
+  if (entity.originType !== "ai_generated") return true;
+  if (entity.lifecycleStatus === "active" || entity.lifecycleStatus === "archived") return true;
+  return entity.hasExplicitActiveMention === true;
 }
 
 function entityCandidates(text: string, entities: readonly KnownEntity[]): Candidate[] {
@@ -156,23 +313,60 @@ function entityCandidates(text: string, entities: readonly KnownEntity[]): Candi
     if (!isRedactionKind(entity.entityType)) {
       throw new Error(`实体 ${entity.entityId} 的 entity_type 不在封闭集内：${entity.entityType}`);
     }
+    // G0：语义层只遮三类。
+    if (!(SEMANTIC_REDACTION_KINDS as readonly string[]).includes(entity.entityType)) continue;
+    if (!entityPassesSourceGate(entity)) continue;
     for (const term of entity.terms) {
-      if (term === "") continue;
-      let from = 0;
-      for (;;) {
-        const at = text.indexOf(term, from);
-        if (at < 0) break;
+      if (!termPassesWordForm(term)) continue;
+      for (const at of findTermOccurrences(text, term)) {
         found.push({
           kind: entity.entityType,
           dedupeKey: `${entity.entityType}\u0000entity\u0000${entity.entityId}`,
           start: at,
           end: at + term.length,
+          source: "entity_memory",
+          entityId: entity.entityId,
         });
-        from = at + term.length;
       }
     }
   }
   return found;
+}
+
+/**
+ * 把外部候选并进来：**先**剔除与任一 rule/entity 候选**有任何重叠**的那条，剩下的才与既有
+ * 候选一起过 `resolveOverlaps`。优先级因此写在代码结构里，不靠数组顺序或排序键的偶然性
+ * （准则 §五 禁区：不得让 LLM 候选覆盖规则命中）。区间不成立（非整数、越界、`end <= start`）
+ * 的不采信：除了这里，产出链路上没有第二道校验，而这些坐标要进 `RedactionMap` 参与反向映射。
+ *
+ * `kind` 同样在这里过封闭集（M9-D-7）：`redact()` 是导出面，而 `redactionMap` 的 `kind` 在
+ * 写入/回读两侧都要求落在封闭集内（`parseRedactionMap`），漏一条 unknown kind 会产出
+ * **读不回来的映射**。区间合法但 kind 伪造 ⇒ 整条丢弃，不抛（上层发送流程不因模型坏输出中断）。
+ *
+ * 同一 kind、同一词面的多条外部候选共用一个占位符，与规则层同一条去重口径（模型才能回溯引用）。
+ */
+function admitExtraCandidates(
+  rawText: string,
+  base: readonly Candidate[],
+  extras: readonly ExtraRedactionCandidate[],
+): Candidate[] {
+  const admitted: Candidate[] = [];
+  for (const extra of extras) {
+    if (!isRedactionKind(extra.kind)) continue;
+    // L2 只产三类（2026-11-04 裁决）。这是第二道保险：调用方即使递来 work/product，也在这里丢弃。
+    if (!(SEMANTIC_REDACTION_KINDS as readonly string[]).includes(extra.kind)) continue;
+    if (!Number.isInteger(extra.start) || !Number.isInteger(extra.end)) continue;
+    if (extra.start < 0 || extra.end <= extra.start || extra.end > rawText.length) continue;
+    if (base.some((held) => held.start < extra.end && extra.start < held.end)) continue;
+    admitted.push({
+      kind: extra.kind,
+      dedupeKey: `${extra.kind}\u0000llm\u0000${rawText.slice(extra.start, extra.end)}`,
+      start: extra.start,
+      end: extra.end,
+      source: "local_llm",
+    });
+  }
+  return admitted;
 }
 
 /**
@@ -203,10 +397,10 @@ export function redact(
   options: RedactionOptions = {},
 ): RedactionResult {
   const nonce = options.nonce ?? newNonce();
+  const base = [...ruleCandidates(rawText), ...entityCandidates(rawText, entities)];
   const candidates = resolveOverlaps([
-    ...ruleCandidates(rawText, PHONE_PATTERN, "phone"),
-    ...ruleCandidates(rawText, EMAIL_PATTERN, "email"),
-    ...entityCandidates(rawText, entities),
+    ...base,
+    ...admitExtraCandidates(rawText, base, options.extraCandidates ?? []),
   ]);
 
   const placeholderByKind = new Map<string, number>();
@@ -232,6 +426,8 @@ export function redact(
       originalEnd: candidate.end,
       redactedStart,
       redactedEnd: out.length,
+      source: candidate.source,
+      ...(candidate.entityId === undefined ? {} : { entityId: candidate.entityId }),
     });
     cursor = candidate.end;
   }
@@ -239,7 +435,7 @@ export function redact(
 
   return {
     redactedText: out,
-    map: { policyVersion: REDACTION_POLICY_VERSION, nonce, spans },
+    map: { policyVersion: options.policyVersion ?? REDACTION_POLICY_VERSION, nonce, spans },
   };
 }
 
@@ -368,6 +564,7 @@ export function redactionMapJsonValue(map: RedactionMap): JsonObject {
       originalEnd: span.originalEnd,
       redactedStart: span.redactedStart,
       redactedEnd: span.redactedEnd,
+      source: span.source,
     })),
   };
 }
@@ -394,7 +591,15 @@ export function parseRedactionMap(value: unknown): RedactionMap {
     ] as const) {
       if (!Number.isInteger(number) || number < 0) throw new Error(`redactionMap 的 ${name} 不是合法偏移：${number}`);
     }
-    return span;
+    // 历史 manifest 没有 source 字段 ⇒ 按 `rule` 补齐、**不报错**：旧 run 的映射只能读不能重算，
+    // 硬拒会让它们整体不可读（草案 §四）。字段存在却不认识 ⇒ 抛错，与 kind 现有处理同形。
+    // 从 `raw` 取值而不是从 `span` 取：`span` 那份断言声称 source 已成立，拿它自检是自我认证。
+    const declared = (raw as { source?: unknown }).source;
+    const source = declared === undefined ? "rule" : declared;
+    if (!isRedactionSource(source)) {
+      throw new Error(`redactionMap 的 source 不在封闭集内：${String(declared)}`);
+    }
+    return { ...span, source };
   });
   for (let i = 1; i < spans.length; i += 1) {
     const previous = spans[i - 1]!;

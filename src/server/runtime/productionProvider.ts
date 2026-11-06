@@ -18,16 +18,30 @@
  */
 
 import type { AppConfig, ModelProfileConfig } from "../config/config.ts";
+import { defaultCredentialStore, type CredentialProfile, type CredentialStore } from "../config/credentials.ts";
 import { ConfigError } from "../config/errors.ts";
+import { DEFAULT_API_KEY_ENV } from "../../shared/constants/model.ts";
 import { httpTransport } from "../ingest/httpTransport.ts";
-import { M2_PROMPT_V1 } from "../ingest/prompts/m2-prompt-v1.ts";
-import type { ModelAdapter, ProcessingMode, ProviderCallPath } from "../ingest/provider.ts";
+import { M2_PROMPT_V2 } from "../ingest/prompts/m2-prompt-v2.ts";
+import {
+  isLoopbackUrl,
+  type ModelAdapter,
+  type ProcessingMode,
+  type ProviderCallPath,
+} from "../ingest/provider.ts";
 import type { IngestProviderBundle } from "./workspace.ts";
 
 /** requestBody 组装的请求本体四键：配置面无权通过 params 覆盖它们。 */
 const FORBIDDEN_PARAM_KEYS = ["model", "messages", "stream", "response_format"] as const;
 
-function buildAdapter(profile: ModelProfileConfig, fieldPrefix: string): ModelAdapter {
+function buildAdapter(
+  profile: ModelProfileConfig,
+  fieldPrefix: string,
+  /** 凭证档位（两家端点、两份密钥）。记录级三轴不影响它：`cloud_raw` 用的就是 `cloud_redacted` 这一档。 */
+  credential: CredentialProfile,
+  credentials: CredentialStore,
+  env: NodeJS.ProcessEnv,
+): ModelAdapter {
   const missing: string[] = [];
   if (profile.model === undefined || profile.model.trim() === "") missing.push(`${fieldPrefix}.model`);
   if (profile.call_path === undefined) missing.push(`${fieldPrefix}.call_path`);
@@ -56,8 +70,10 @@ function buildAdapter(profile: ModelProfileConfig, fieldPrefix: string): ModelAd
     callPath: profile.call_path as ProviderCallPath,
     supportsStructuredOutput: profile.supports_structured_output ?? false,
     requestTimeoutMs: profile.request_timeout_ms,
-    // 只传变量名；密钥值永不进装配对象、不进配置、不进日志。
-    apiKeyEnv: profile.api_key_env,
+    // 只保留变量名与取密钥闭包；密钥值永不进装配对象、不进配置、不进日志。
+    apiKeyEnv: profile.api_key_env ?? DEFAULT_API_KEY_ENV,
+    resolveApiKey: () =>
+      credentials.resolve(credential, profile.api_key_env ?? DEFAULT_API_KEY_ENV, env).key,
     ...(params === undefined ? {} : { params }),
   };
 }
@@ -65,6 +81,7 @@ function buildAdapter(profile: ModelProfileConfig, fieldPrefix: string): ModelAd
 export function buildProductionProvider(
   config: AppConfig,
   env: NodeJS.ProcessEnv,
+  credentials: CredentialStore = defaultCredentialStore(env),
 ): IngestProviderBundle | null {
   const model = config.model;
   const hasProfiles = model.local_model !== undefined || model.cloud_model !== undefined;
@@ -72,14 +89,30 @@ export function buildProductionProvider(
   if (hasProfiles) {
     const adapters: Partial<Record<ProcessingMode, ModelAdapter>> = {};
     if (model.local_model?.enabled === true) {
-      adapters.local_model = buildAdapter(model.local_model, "model.local_model");
+      adapters.local_model = buildAdapter(
+        model.local_model,
+        "model.local_model",
+        "local_model",
+        credentials,
+        env,
+      );
     }
     if (model.cloud_model?.enabled === true) {
-      adapters.cloud_redacted = buildAdapter(model.cloud_model, "model.cloud_model");
+      const cloud = buildAdapter(
+        model.cloud_model,
+        "model.cloud_model",
+        "cloud_redacted",
+        credentials,
+        env,
+      );
+      adapters.cloud_redacted = cloud;
+      // `cloud_raw` 登记的是**同一个适配器对象**（草案 §六）：两家端点没有第三家，密钥也没有
+      // 第三份，差别只在发出去的那份文本是原文还是脱敏文本——那是三轴与授权绑定的事，不是装配的事。
+      adapters.cloud_raw = cloud;
     }
-    const adapter = adapters.cloud_redacted ?? adapters.local_model;
+    const adapter = adapters.cloud_redacted ?? adapters.cloud_raw ?? adapters.local_model;
     if (adapter === undefined) return null;
-    return { adapter, adapters, transport: httpTransport, systemPrompt: M2_PROMPT_V1 };
+    return { adapter, adapters, transport: httpTransport, systemPrompt: M2_PROMPT_V2 };
   }
 
   // 旧配置仍按单一适配器装配，避免升级瞬间改变既有行为。
@@ -88,7 +121,7 @@ export function buildProductionProvider(
     enabled: true,
     provider: model.provider,
     base_url: model.base_url,
-    api_key_env: model.api_key_env,
+    api_key_env: model.api_key_env ?? DEFAULT_API_KEY_ENV,
     request_timeout_ms: model.request_timeout_ms,
     ...(model.model === undefined ? {} : { model: model.model }),
     ...(model.call_path === undefined ? {} : { call_path: model.call_path }),
@@ -97,7 +130,13 @@ export function buildProductionProvider(
       : { supports_structured_output: model.supports_structured_output }),
     ...(model.params === undefined ? {} : { params: model.params }),
   };
-  const adapter = buildAdapter(legacy, "model");
+  const adapter = buildAdapter(
+    legacy,
+    "model",
+    isLoopbackUrl(legacy.base_url) ? "local_model" : "cloud_redacted",
+    credentials,
+    env,
+  );
 
-  return { adapter, transport: httpTransport, systemPrompt: M2_PROMPT_V1 };
+  return { adapter, transport: httpTransport, systemPrompt: M2_PROMPT_V2 };
 }

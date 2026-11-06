@@ -71,12 +71,20 @@ describe("M5-4P · 顶层导航", () => {
     for (const entry of BOX_SUB_TABS) expect(tabOf(entry.key)).toBe("boxes");
   });
 
-  it("quick / sleep 仍是动作页，语义没被改成可逛的地方", () => {
+  it("quick / sleep / edit 仍是动作页，语义没被改成可逛的地方", () => {
     const nav = source("ui/nav.ts");
-    expect(nav).toContain('export const STANDALONE: readonly ViewKey[] = ["quick", "sleep", "overview"]');
+    // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批4-编辑独立页与保存确认.md〕
+    // 旧判据把三格逐字钉死。批 4 按方案 C 把 `edit`（编辑原文）加进 STANDALONE：
+    // 它是**写**这个动作的独占面，与 quick / sleep 同一族——不进标签栏、自带返回。
+    // 判据因此从「三个字面值」变成「这一族恰好是这四个、且每个都归今天」，
+    // 比原来更难满足（多了一个必须归在这条线上的成员），能力没有删。
+    expect(nav).toContain(
+      'export const STANDALONE: readonly ViewKey[] = ["quick", "sleep", "edit", "overview"]',
+    );
     // 动作页归到「今天」这条线上，所以高亮仍然对。
     expect(tabOf("quick")).toBe("today");
     expect(tabOf("sleep")).toBe("today");
+    expect(tabOf("edit")).toBe("today");
   });
 
   it("外壳画的就是这三项，并把主题开关接在标题栏", () => {
@@ -290,7 +298,6 @@ describe("M5-4P · 两档布局的声明面", () => {
       ".today-pending {",
       ".tab-icon {",
       ".tab-label {",
-      ".link-btn {",
       ".head-tools {",
       ".theme-toggle {",
     ]) {
@@ -314,13 +321,17 @@ describe("M5-4P · 两档布局的声明面", () => {
     expect(cssRule(css, ".shell {")).toContain("box-sizing: border-box");
   });
 
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批8-link-btn退场.md〕
+  // 批 7 让 `.link-btn` 退场（它只剩今天页「全部片段」一处，已改成 `.btn`）。
+  // 判据因此少了这一个类，其余一个字没动：`.btn` 44px、`.tab-btn` 56px、`.sub-btn`/`.theme-toggle` 40px。
+  // 这是把一个已经没有用户的类从清单里去掉，不是放宽任何一档的阈值。
   it("可点条目都有明确的触控高度：主按钮与导航 44px，次级 pill 40px", () => {
-    for (const selector of [".btn {", ".tab-btn {", ".link-btn {", ".theme-toggle {", ".sub-btn {"]) {
+    for (const selector of [".btn {", ".tab-btn {", ".theme-toggle {", ".sub-btn {"]) {
       expect(cssRule(css, selector), `${selector} 没有 min-height`).toContain("min-height");
     }
     expect(cssRule(css, ".btn {")).toContain("min-height: 2.75rem");
     expect(cssRule(css, ".tab-btn {")).toContain("min-height: 3.5rem");
-    for (const selector of [".sub-btn {", ".link-btn {", ".theme-toggle {"]) {
+    for (const selector of [".sub-btn {", ".theme-toggle {"]) {
       expect(cssRule(css, selector)).toContain("min-height: 2.5rem");
     }
   });

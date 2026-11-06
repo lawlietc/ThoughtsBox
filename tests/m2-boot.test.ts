@@ -14,7 +14,7 @@ import {
   openSandboxDb,
   type Sandbox,
 } from "./helpers/sandbox.ts";
-import { makeAdapter, OK_ENVELOPE, stubTransport, SYSTEM_PROMPT, validOutput, FIXTURE_NOW } from "./helpers/ingestFixtures.ts";
+import { makeAdapter, OK_ENVELOPE, setRecordMode, stubTransport, SYSTEM_PROMPT, validOutput, FIXTURE_NOW } from "./helpers/ingestFixtures.ts";
 
 /**
  * M2-6 启动整合与数据面演进的验收（§13.2 / §十二 / dataCheck 分层）。
@@ -117,7 +117,7 @@ describe("M2-6 启动整合（服务进入 boot + T-13 时序）", () => {
     // 建一条 local_model 记录（默认 manual_only，改模式仅为逼近真实解析意图）。
     const created = booted.workspace.records.createRecord("待解析但无 Provider 的记录");
     const recordId = created.record.id;
-    booted.db.prepare("update capture_record set processing_mode = 'local_model' where id = ?").run(recordId);
+    setRecordMode(booted.db, recordId, "local_model");
 
     const res = await fetch(`http://127.0.0.1:${port}/api/ingest/parse`, {
       method: "POST",

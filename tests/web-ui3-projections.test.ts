@@ -15,6 +15,7 @@ import {
   parsedCount,
   toRowView,
 } from "../src/web/projections.ts";
+import { axesForProcessingMode, isProcessingModeValue } from "../src/shared/contracts/enums.ts";
 import type { DeletePhaseResult, EffectiveResultDto, RecordRow } from "../src/shared/dto.ts";
 
 /**
@@ -30,6 +31,9 @@ import type { DeletePhaseResult, EffectiveResultDto, RecordRow } from "../src/sh
  */
 
 function recordRow(over: Partial<RecordRow>): RecordRow {
+  const mode = over.processing_mode ?? "manual_only";
+  if (!isProcessingModeValue(mode)) throw new Error(`夹具写入了契约外的 processing_mode：${mode}`);
+  const axes = axesForProcessingMode(mode);
   return {
     id: "rec_000000000000000000000000000001",
     created_at_utc: "2026-10-16T05:04:05.123Z",
@@ -38,8 +42,12 @@ function recordRow(over: Partial<RecordRow>): RecordRow {
     created_local_date: "2026-10-16",
     current_revision_id: "rev_000000000000000000000000000001",
     processing_status: "captured",
-    processing_mode: "manual_only",
+    processing_mode: mode,
     privacy_level: "normal",
+    // M6-0C：派生列与三轴成对出现（0008 的表级 CHECK 在库里就是这么要求的）。
+    analysis_provider: axes.analysisProvider,
+    redaction_mode: axes.redactionMode,
+    send_content_mode: axes.sendContentMode,
     ...over,
   };
 }

@@ -345,46 +345,46 @@ describe("quick / sleep / settings：模式写端点接通后的单选契约，�
   // 该前提只仍成立于 Sleep / Settings，对 Quick 失效。按新契约逐页改写，不削弱意图。
   const RADIO = /<input\s+type="radio"[\s\S]*?\/>/g;
 
-  it("QuickPanel：模式单选来自共享 ProcessingModePicker，且已可点（解 disabled、带 checked/onChange）", () => {
+  it("QuickPanel：写入页恢复四档选择器，初始档位来自共用的默认值", () => {
+    // 〔2026-11-06 用户裁定〕写入页恢复四档选择器，与设置页、睡前页共用同一个默认值；
+    // 单条记录的改档仍落在记录详情里。
     const text = source("QuickPanel.tsx");
-    const picker = source("ui/ProcessingModePicker.tsx");
     expect(text).toContain("<ProcessingModePicker");
-    expect(picker).toContain("processingModeChoices()");
-    const radios = [...picker.matchAll(RADIO)];
-    expect(radios.length, "QuickPanel 该有模式单选").toBeGreaterThan(0);
-    for (const radio of radios) {
-      expect(radio[0], "M5-1 已开写端点：radio 不得再 disabled").not.toContain("disabled");
-      expect(radio[0], "可点就必须反映选中态").toContain("checked=");
-      expect(radio[0], "可点就必须接 onChange").toContain("onChange=");
-    }
+    expect(text).toContain(
+      "resolveEntryMode(cfg.processingDefaults.recordDefaultMode, cfg.processingAvailability)",
+    );
+    expect(text).toContain("quickSecondActionFor(mode)");
+    expect(text).toContain('disabled={busy !== null || text.trim() === ""}');
   });
 
   it("QuickPanel：保存把所选模式真的写出去——api.createRecord(text, mode)", () => {
     expect(source("QuickPanel.tsx")).toMatch(/api\.createRecord\(\s*text\s*,\s*mode\s*\)/);
   });
 
-  it("SleepPanel：与快速记录共用可选择模式，并把所选模式写入 createRecord", () => {
+  it("SleepPanel：恢复四档选择器，与设置页/写入页共用同一个默认值", () => {
+    // 〔2026-11-06 用户裁定〕睡前页恢复四档选择器；写进来就是所选档位。
     const text = source("SleepPanel.tsx");
-    const picker = source("ui/ProcessingModePicker.tsx");
     expect(text).toContain("<ProcessingModePicker");
     expect(text).toMatch(/api\.createRecord\(\s*text\s*,\s*mode\s*\)/);
-    expect(picker).toContain("processingModeChoices()");
-    const radios = [...picker.matchAll(RADIO)];
-    expect(radios.length, "SleepPanel 该有模式单选").toBeGreaterThan(0);
-    for (const radio of radios) {
-      expect(radio[0], "两页共用后可点").not.toContain("disabled");
-      expect(radio[0], "可点就必须反映选中态").toContain("checked=");
-      expect(radio[0], "可点就必须接 onChange").toContain("onChange=");
-    }
+    // 睡前页仍不显示任何待确认计数、不挽留：语义由后面三条 not.toContain 钉住。
+    expect(text).not.toContain("pendingCount");
   });
 
-  it("SettingsPanel：默认模式仍只读（配置即代码，不走界面写），radio 仍全部 disabled", () => {
+  it("SettingsPanel：M5-6 起默认整理方式可编辑——radio 带 checked/onChange，禁用只按可用性动态", () => {
+    // 〔M5-6 契约变更〕旧断言「默认模式没有写端点，不该能点」的前提已被规划推翻：
+    // PATCH /api/ingest/config/processing 开了写通路，设置页必须能改两个默认值并独立保存。
     const text = source("SettingsPanel.tsx");
     expect(text).toContain("processingModeChoices()");
+    expect(text).toContain("api.updateProcessingDefaults");
+    expect(text).toContain("保存整理方式");
     const radios = [...text.matchAll(RADIO)];
     expect(radios.length, "SettingsPanel 该有默认模式单选").toBeGreaterThan(0);
     for (const radio of radios) {
-      expect(radio[0], "默认模式没有写端点，不该能点").toContain("disabled");
+      expect(radio[0], "可编辑就必须反映选中态").toContain("checked=");
+      expect(radio[0], "可编辑就必须接 onChange").toContain("onChange=");
+      if (radio[0].includes("disabled")) {
+        expect(radio[0], "M5-6：不可用档位动态禁用，不许裸 disabled").toContain("disabled={");
+      }
     }
   });
 
@@ -392,10 +392,12 @@ describe("quick / sleep / settings：模式写端点接通后的单选契约，�
   // QuickPanel 没有第二动作；M5-2 明确给 local 档加了「保存并整理」。按新契约拆成两条，
   // 除这一点外未放宽任何意图：SleepPanel 仍一字不变地不许碰整理，QuickPanel 仍不许碰
   // reparse / preview / confirm-send。
-  it("M5-2 新契约：QuickPanel 的 local「保存并整理」会发起 api.ingestParse，但仍不碰 reparse/preview/confirm-send", () => {
+  // 〔整理方式改动再变更〕第二动作从「本页同步跑模型」改成「排进后台队列」：QuickPanel 现在
+  // 一个模型调用都不发（连 `api.ingestParse` 也没有），只 `api.enqueueJob`。判据因此收紧了一格。
+  it("整理方式新契约：QuickPanel 的第二动作只入队（api.enqueueJob），不 parse / reparse / preview / confirm-send", () => {
     const text = source("QuickPanel.tsx");
-    expect(text).toMatch(/\bapi\.ingestParse\b/);
-    expect(text).not.toMatch(/\bapi\.ingest(Reparse|Preview|ConfirmSend)\b/);
+    expect(text).toMatch(/\bapi\.enqueueJob\b/);
+    expect(text).not.toMatch(/\bapi\.ingest(Parse|Reparse|Preview|ConfirmSend)\b/);
   });
 
   it("SleepPanel 仍不擅自发起整理（没有 parse/reparse/preview/confirm-send 调用）", () => {
@@ -410,7 +412,9 @@ describe("quick / sleep / settings：模式写端点接通后的单选契约，�
     expect(text).toContain("收好并结束");
     // 〔M5-3B 有意变动·理由单列在工作日志〕旧钉的是「不检查任何队列」这句长说明；
     // 方案 §6.12 把它压成一句。语义等价：仍然直接可见「收好不检查没处理的条目、不催促」。
-    expect(text).toContain("不会数你还有多少条没处理");
+    // 〔web-redesign 有意变动 · 理由单列在 2026-11-02 工作日志〕压成的一句也退场：这句是界面自述
+    // 姿态，不是用户的数据。不削弱：不挽留仍由上面三条 not.toContain、主按钮「收好并结束」与
+    // 收尾页「这些事情已经收好了。」共同钉住。
     expect(text).toContain("这些事情已经收好了。");
   });
 
@@ -420,19 +424,25 @@ describe("quick / sleep / settings：模式写端点接通后的单选契约，�
     expect(text).not.toMatch(/\bapi\.listRecords\b/);
   });
 
-  it("设置页提供本地 / 云端两档模型配置，同时默认整理方式仍只读", () => {
+  it("设置页提供本地 / 云端两档模型配置；M5-6 起整理方式独立保存、不共用模型保存", () => {
     const text = source("SettingsPanel.tsx");
     expect(text).toContain("api.ingestConfig()");
     expect(text).toContain("api.updateModelConfig");
     expect(text).toContain("本地模型");
     expect(text).toContain("云端模型");
     expect(text).toContain("保存模型配置");
-    expect(text).toContain("密钥环境变量名");
+    expect(text).not.toContain("密钥环境变量名");
+    expect(text).toContain("密钥可选");
     expect(text).toContain("重启本地后端后生效");
+    // 〔M5-6 契约变更〕「默认整理方式仍只读」被规划推翻：整理方式有自己的 PATCH 与独立保存按钮。
+    expect(text).toContain("保存整理方式");
     const radios = [...text.matchAll(RADIO)];
-    expect(radios.length, "默认模式仍由配置文件决定").toBeGreaterThan(0);
+    expect(radios.length, "默认模式单选必须还在").toBeGreaterThan(0);
     for (const radio of radios) {
-      expect(radio[0]).toContain("disabled");
+      expect(radio[0], "可编辑就必须接 onChange").toContain("onChange=");
+      if (radio[0].includes("disabled")) {
+        expect(radio[0], "M5-6：不可用档位动态禁用，不许裸 disabled").toContain("disabled={");
+      }
     }
   });
 });

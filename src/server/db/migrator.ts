@@ -118,7 +118,14 @@ export function migrate(db: Database, dir = MIGRATIONS_DIR): MigrationResult {
       ).run(file.version, file.name, file.sha256, new Date().toISOString());
       db.exec("COMMIT");
     } catch (cause) {
-      db.exec("ROLLBACK");
+      // 迁移文件可以自行交出事务边界（0008 需要在事务外关外键），故 ROLLBACK 可能已无事务可用。
+      // 吞掉它只为了不覆盖真正的失败原因；外键随后一律恢复成 applyPragmas 承诺的形态。
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* 无活动事务 */
+      }
+      db.exec("PRAGMA foreign_keys = ON");
       throw new MigrationError(
         `迁移 ${file.version}_${file.name} 失败，已回滚：${(cause as Error).message}`,
       );

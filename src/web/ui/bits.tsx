@@ -87,9 +87,7 @@ export function EvidenceLine(props: EvidenceLineProps): React.ReactNode {
   }
   if (!evidence.anchored) {
     return (
-      <p className="warn">
-        证据回锚失败：模型给的「{evidence.text}」在原文中找不到 —— 按契约它不得成为有效提及。
-      </p>
+      <p className="warn">证据点不回原文：「{evidence.text}」</p>
     );
   }
   return (

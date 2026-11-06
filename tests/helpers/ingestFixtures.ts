@@ -1,4 +1,8 @@
 import { RecordService } from "../../src/server/records/service.ts";
+import {
+  axesForProcessingMode,
+  isProcessingModeValue,
+} from "../../src/shared/contracts/enums.ts";
 import { seedConceptId } from "../../src/shared/contracts/ids.ts";
 import { redact, type KnownEntity } from "../../src/server/privacy/redaction.ts";
 import type { Database } from "../../src/server/db/adapter.ts";
@@ -53,6 +57,7 @@ export function validOutput(): StructuredOutput {
     emotions: [{ labelSaid: "焦虑", candidateConceptId: ANXIETY_CONCEPT, basis: "explicit", evidence: "我感到焦虑" }],
     topics: [{ labelSaid: "工作", candidateConceptId: WORK_CONCEPT, basis: "explicit", evidence: "讨论了发布计划" }],
     entities: [{ labelSaid: "项目组", candidateConceptId: null, basis: "explicit", evidence: "和项目组的同事" }],
+    relations: [],
   };
 }
 
@@ -69,6 +74,7 @@ export function validCloudOutput(): StructuredOutput {
     emotions: [{ labelSaid: "开心", candidateConceptId: seedConceptId("开心"), basis: "explicit", evidence: "聊了三个小时" }],
     topics: [{ labelSaid: "社交", candidateConceptId: seedConceptId("朋友与社交"), basis: "explicit", evidence: `和${PH_PERSON}去了` }],
     entities: [{ labelSaid: "张三", candidateConceptId: null, basis: "explicit", evidence: `和${PH_PERSON}` }],
+    relations: [],
   };
 }
 
@@ -148,6 +154,25 @@ export interface FixtureRecord {
 }
 
 /**
+ * M6-0C：把记录的整理方式落库的**唯一夹具入口**。
+ *
+ * 为什么需要它：`processing_mode` 降级为派生字段后，0008 的表级 CHECK 要求它逐字等于三轴的
+ * 派生结果。以前各处那句 `update capture_record set processing_mode = ?` 现在会被数据库拒绝；
+ * 而十几份测试各自补三列又会抄出十几套「派生规则」。所以派生只在这里写一遍，
+ * 取值来自 `contracts/enums.ts`（与 enums.json 装载时对账）。**不动 status**——改状态是
+ * 服务层的职责，夹具只做「用户已经选好这一档」的既成事实。
+ */
+export function setRecordMode(db: Database, recordId: string, mode: string): void {
+  if (!isProcessingModeValue(mode)) {
+    throw new Error(`夹具写入了契约外的 processing_mode：${mode}`);
+  }
+  const axes = axesForProcessingMode(mode);
+  db.prepare(
+    "update capture_record set processing_mode = ?, analysis_provider = ?, redaction_mode = ?, send_content_mode = ? where id = ?",
+  ).run(mode, axes.analysisProvider, axes.redactionMode, axes.sendContentMode, recordId);
+}
+
+/**
  * 建一条记录并按需改 mode。
  * mode 是用户在记录上的既定设置（§4.8），`capture_record.processing_mode` 的默认值是
  * `manual_only`；契约里没有服务层的 mode setter，所以夹具只能按用户动作的方式落库。
@@ -155,8 +180,6 @@ export interface FixtureRecord {
 export function createRecord(db: Database, text: string, processingMode?: string): FixtureRecord {
   const service = new RecordService(db, { timezoneId: FIXTURE_TIMEZONE, now: () => new Date(FIXTURE_NOW) });
   const created = service.createRecord(text);
-  if (processingMode !== undefined) {
-    db.prepare("update capture_record set processing_mode = ? where id = ?").run(processingMode, created.record.id);
-  }
+  if (processingMode !== undefined) setRecordMode(db, created.record.id, processingMode);
   return { recordId: created.record.id, revisionId: created.revision.id };
 }

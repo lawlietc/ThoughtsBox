@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { migrate } from "../src/server/db/migrator.ts";
+import { listMigrationFiles, migrate } from "../src/server/db/migrator.ts";
 import { RecordService } from "../src/server/records/service.ts";
 import { seedVocabulary } from "../src/server/db/seed.ts";
 import { loadVocab } from "../src/shared/contracts/load.ts";
@@ -45,6 +45,8 @@ interface RelationType {
   readonly type: string;
   readonly carrier: string;
   readonly directed: boolean;
+  /** 允许写入这一类关系的来源（K-18 的逐类型判据，store 层与这里同源）。 */
+  readonly creators: string[];
 }
 
 /** 状态机的字面量键名：写错的键在编译期就拒绝，而不是运行时静默拿到 undefined。 */
@@ -113,17 +115,14 @@ function stripComments(source: string): string {
     .join("\n");
 }
 const sqlCode = stripComments(sql);
-/** 前缀 CHECK 的守门面覆盖全部已应用的迁移，不只 0003：新表漏写约束是跨里程碑的风险。 */
-const sqlAllCode = [
-  "0001_bootstrap.sql",
-  "0002_records_and_search.sql",
-  "0003_derived_layer.sql",
-  "0004_correction_layer.sql",
-  "0005_override_value_gate.sql",
-  "0006_entity_types_v2.sql",
-  "0007_schema_backfill_m2_debt.sql",
-]
-  .map((name) => stripComments(readFileSync(`src/server/db/migrations/${name}`, "utf8")))
+/**
+ * 前缀 CHECK 的守门面覆盖全部已应用的迁移，不只 0003：新表漏写约束是跨里程碑的风险。
+ * 清单从 migrator 自己的目录现取（`listMigrationFiles()`），不写死 0001…00NN ——
+ * 写死等于把「每份迁移都守这条」降级成「HEAD 恰好等于某个版本号」：下一份迁移（0012）落地时
+ * 会红在一次与契约无关的清单维护上。同 `m3-db-2-schema-backfill` 的改向同一立场。
+ */
+const sqlAllCode = listMigrationFiles()
+  .map((file) => stripComments(file.sql))
   .join("\n");
 const enums = JSON.parse(readFileSync(ENUMS_FILE, "utf8")) as Enums;
 
@@ -169,6 +168,43 @@ function defaultOf(table: string, column: string): string | null {
     tableBlock(sqlCode, table),
   );
   return match === null ? null : match[1]!;
+}
+
+/**
+ * ── 活库（已 migrate 到 HEAD）的 schema 面 ─────────────────────────────
+ * `definitionList` / `tableList` / `defaultOf` 读的都是 **0003 的源码**，而 0003 逐字冻结、受 sha256
+ * 守护：它从此只是旧契约的字面档案。0011 整表重建 `graph_edge`（换 `relation_type` 取值集、
+ * 加 `ai_generated`、把无向归一 CHECK 的豁免名单从一个值扩到两个值），所以「现行库到底守什么」
+ * 只能问 `sqlite_master`。与 M3-DB-1 的 entity_type 改向同一立场（见上面那条注释）。
+ *
+ * SQLite 原样保留建表语句里的整行注释，而 0011 的头注正好在讲这些字面量本身——
+ * 注释里的字面量不参与对账，故先按行剥掉。
+ */
+function liveSql(table: string): string {
+  const row = db
+    .prepare("select sql from sqlite_master where type = 'table' and name = ?")
+    .get(table) as { sql: string };
+  return stripComments(row.sql);
+}
+
+/** 活库某表某列定义处的 `column IN ( … )` 字面量清单（含顺序）。 */
+function liveInList(table: string, column: string): string[] {
+  const match = new RegExp(`${column} TEXT[^C]*CHECK \\(\\s*${column} IN \\(([\\s\\S]*?)\\)`).exec(
+    liveSql(table),
+  );
+  if (match === null) throw new Error(`活库 schema 里没有 ${table}.${column} 的定义处 IN (...) CHECK`);
+  return [...match[1]!.matchAll(/'([^']*)'/g)].map((m) => m[1]!);
+}
+
+/**
+ * 活库里被豁免字典序归一的关系类型清单——即 `CHECK (relation_type IN (…) OR src_id <= dst_id)`
+ * 的 `IN` 那一项。0003 时代这一支写成 `relation_type = 'merged_into'`，0011 改成 `IN (…)`：
+ * 取值面是**一份清单**，不再是一个值，所以按单解析、不按「恰好一个」的正则猜。
+ */
+function liveDirectedExemptions(): string[] {
+  const match = /CHECK \(relation_type IN \(([^)]*)\) OR src_id <= dst_id\)/.exec(liveSql("graph_edge"));
+  if (match === null) throw new Error("活库 schema 里找不到无向归一 CHECK 的豁免清单");
+  return [...match[1]!.matchAll(/'([^']*)'/g)].map((m) => m[1]!);
 }
 
 function attemptRollback(statement: () => void): void {
@@ -436,7 +472,10 @@ describe("T-16：0003 的枚举 CHECK 与 enums.json 单一事实源逐项一致
       states["ParseRun.execution_status"].values,
     );
     expect(tableList("parse_run", "result_state")).toEqual(states["ParseRun.result_state"].values);
-    expect(definitionList("relation_type")).toEqual(
+    // 改向〔M7-1，迁移 0011〕：`graph_edge.relation_type` 的现行取值面搬到了活库 schema（0011 整表重建），
+    // 0003:633 那份 3 值就此成为旧契约的字面档案 —— 与上面 entity_type 同一立场。这里问的是「库里现在
+    // 到底认哪几类」，所以读 HEAD 之后的建表语句，与 enums 的 GraphEdge 子集逐项、含顺序对账。
+    expect(liveInList("graph_edge", "relation_type")).toEqual(
       enums.relation_types.filter((r) => r.carrier === "GraphEdge").map((r) => r.type),
     );
     // 缺省值必须是各自状态机的入口态——逐表核对，不靠字面量清单里的顺序。
@@ -452,12 +491,19 @@ describe("T-16：0003 的枚举 CHECK 与 enums.json 单一事实源逐项一致
   });
 
   it("graph_edge 方向字面量与 relation_types[].directed 一致：只有有向类型被豁免字典序归一", () => {
-    const exempt = /CHECK \(relation_type = '([a-z_]+)' OR src_id <= dst_id\)/.exec(sqlCode);
-    expect(exempt).not.toBeNull();
-    const exemptType = exempt![1]!;
+    // 改向〔M7-1，迁移 0011〕：豁免面从「一个值」变成「一份清单」（`merged_into` + `reports_to`），
+    // 旧正则只认 `relation_type = 'xxx'` 那一种写法，既读不到第二个值、也只比了一半就收工。
+    // 现在按清单解析，两侧都对账：清单内每个类型必须声明 directed=true，清单外每个 GraphEdge
+    // 类型必须 directed=false。少豁免一个、多豁免一个，都在这两条之一上红。
+    const exempt = liveDirectedExemptions();
+    expect(exempt).not.toHaveLength(0);
     const graphEdges = enums.relation_types.filter((r) => r.carrier === "GraphEdge");
-    expect(graphEdges.find((r) => r.type === exemptType)!.directed).toBe(true);
-    for (const rel of graphEdges.filter((r) => r.type !== exemptType)) {
+    const declared = graphEdges.map((r) => r.type);
+    for (const type of exempt) {
+      expect(declared).toContain(type);
+      expect(graphEdges.find((r) => r.type === type)!.directed).toBe(true);
+    }
+    for (const rel of graphEdges.filter((r) => !exempt.includes(r.type))) {
       expect(rel.directed).toBe(false);
     }
   });
@@ -472,10 +518,56 @@ describe("T-16：0003 的枚举 CHECK 与 enums.json 单一事实源逐项一致
     }
   });
 
-  it("AI 永不创建的关系，其写入者取值集合里没有 ai_generated（K-18）", () => {
+  it("K-18「AI 永不创建 same_as / merged_into」：现行库放行三值来源，这条不变式的落点在存储层（graph/store.ts）", () => {
+    // 改向〔M7-1，迁移 0011〕：旧写法 `definitionList("created_by") == [user, user_confirmed_suggestion]`
+    // 读的是 0003 源码，那句「AI 直接建边在这张表里没有落点」对**现行库**已经为假 —— 0011 放行
+    // `ai_generated` 之后，取值集合里就是有第三个值。这条测试不删、也不空断言，只做两件它一直做的事：
+    //   ① 现行库的 `created_by` 取值面**恰好**三值（第四个值，哪怕 `system_seed`，一律红）；
+    //   ② K-18 的**契约面**判据：`ai_may_never_create` 里每一类都不得声明 `ai_generated` 来源。
+    // 「AI 永不创建 same_as / merged_into」这条**不变式没有消失，只是换了落点**：交叉约束
+    // （哪个类型 × 哪个来源的组合非法）单列 CHECK 表达不了，它现在住在
+    // `src/server/graph/store.ts` 的 `AI_NEVER_CREATE`（判据同样读 `enums.relation_type_rules`，
+    // 不抄第二份清单）。断言见 `tests/m7-1-graph-contract.test.ts` §I：I1 契约面、I2 store 真的挡下
+    // （抛在 K-18 那一支而不是顺路挡下的「端点种类不对」）、I3 库里物理上写得进 `same_as + ai_generated`
+    // ——I3 正是「这道门不冗余、且不落在本层」的直接证据。
+    expect(liveInList("graph_edge", "created_by")).toEqual([
+      "user",
+      "user_confirmed_suggestion",
+      "ai_generated",
+    ]);
+    // 档案面照旧被读着：0003 那份两值清单仍是历史事实，K-18 当年正是由它整体兜住的。
     expect(definitionList("created_by")).toEqual(["user", "user_confirmed_suggestion"]);
-    for (const never of enums.relation_type_rules.ai_may_never_create) {
-      expect(enums.relation_types.find((r) => r.type === never)!.carrier).not.toBe("derived_from_mention");
+
+    const never = enums.relation_type_rules.ai_may_never_create;
+    for (const type of never) {
+      const rel = enums.relation_types.find((r) => r.type === type);
+      expect(rel, `enums 里没有关系类型 ${type}`).toBeDefined();
+      // 原断言，一字不删：AI 永不创建的这几类都不是「派生自 Mention」的投影类。
+      expect(rel!.carrier).not.toBe("derived_from_mention");
+      // 契约面：这几类的允许来源里不得出现 ai_generated —— 存储层那条门的判据就是这一句。
+      expect(rel!.creators).not.toContain("ai_generated");
+    }
+    // 落在 GraphEdge 载体上的那一部分，恰是 `same_as` / `merged_into`（`triggered_by` 不入图）。
+    const neverOnEdge = enums.relation_types
+      .filter((r) => r.carrier === "GraphEdge" && never.includes(r.type))
+      .map((r) => r.type)
+      .sort();
+    expect(neverOnEdge).toEqual(["merged_into", "same_as"]);
+    // 反向对账：GraphEdge 九值里声明了 `ai_generated` 的，恰是六类新社会关系，且不落在 never 清单里。
+    const aiCreatableOnEdge = enums.relation_types
+      .filter((r) => r.carrier === "GraphEdge" && r.creators.includes("ai_generated"))
+      .map((r) => r.type)
+      .sort();
+    expect(aiCreatableOnEdge).toEqual([
+      "classmate_of",
+      "colleague_of",
+      "family_of",
+      "partner_of",
+      "reports_to",
+      "friend_of",
+    ].sort());
+    for (const type of aiCreatableOnEdge) {
+      expect(never).not.toContain(type);
     }
   });
 
@@ -536,8 +628,8 @@ describe("T-15：每张派生表的 id 前缀 CHECK", () => {
       run: (id) =>
         db
           .prepare(
-            `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-             values (@id, @rev, @h1, @h2, 'rules-v1', @now)`,
+            `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+             values (@id, @rev, 'redacted', @h1, @h2, 'rules-v1', @now)`,
           )
           .run({ id, rev: revisionId, h1: HEX64, h2: "a".repeat(64), now: NOW }),
     },
@@ -915,22 +1007,42 @@ describe("T-05 / B3：执行态与结果态分离（双态模型的组合不变�
     );
   });
 
-  it("同一 (revision, 指纹) 至多一个未定案/现行 run（ux_run_live）：重试复用、重跑需新指纹或先弃旧候选", () => {
+  it("同一 (revision, 指纹) 至多一个在途 run（ux_run_live，0012 收窄后）：在途互斥、已定案结果可与新候选共存", () => {
+    // 不变量一条没少，只是换了谓词：同一条管线上两份**在途**工作仍然写不到一起（重试复用、并发不长第二行）。
     expectRejected(
       () => {
-        insertRun("run_live_1", { source_revision_id: revision2 });
-        insertRun("run_live_2", { source_revision_id: revision2 });
+        insertRun("run_live_1", { source_revision_id: revision2, execution_status: "running" });
+        insertRun("run_live_2", { source_revision_id: revision2, execution_status: "running" });
       },
       /UNIQUE constraint failed: parse_run.source_revision_id, parse_run.pipeline_fingerprint/,
     );
-    expectAccepted(() =>
-      insertRun("run_live_newfp", { source_revision_id: revision2, pipeline_fingerprint: "b".repeat(64) }),
+    // queued 与 running 同属在途（0012 的谓词是这两值合一，不是只钉 running）。
+    expectRejected(
+      () => {
+        insertRun("run_live_q", { source_revision_id: revision2, execution_status: "queued" });
+        insertRun("run_live_r", { source_revision_id: revision2, execution_status: "running" });
+      },
+      /UNIQUE constraint failed: parse_run.source_revision_id, parse_run.pipeline_fingerprint/,
     );
-    // 旧候选定案（superseded）后，同指纹可以再开一次。
+    // 重新分析的前提（M8-D-5）：定案的旧结果不再占用在途名额 ⇒ 旧 current 与新 candidate 同指纹共存，
+    // 直到用户采纳（旧行转 superseded）或放弃。「至多一个 current」由 ux_run_current 独家守（见上一条用例）。
     expectAccepted(() => {
-      db.prepare("update parse_run set result_state = 'superseded' where id = 'run_fixture_1'").run();
-      insertRun("run_live_after", {});
+      insertRun("run_live_old_current", { source_revision_id: revision2, result_state: "current" });
+      insertRun("run_live_new_candidate", { source_revision_id: revision2, execution_status: "running" });
     });
+    // 两份都已定案的同指纹历史同样共存——索引不管历史，历史可以有很多份。
+    expectAccepted(() => {
+      insertRun("run_live_hist_1", { source_revision_id: revision2, result_state: "current" });
+      insertRun("run_live_hist_2", { source_revision_id: revision2, result_state: "superseded" });
+    });
+    // 不同指纹照旧放行：在途互斥按管线分组，不是按 revision 全局。
+    expectAccepted(() =>
+      insertRun("run_live_newfp", {
+        source_revision_id: revision2,
+        execution_status: "running",
+        pipeline_fingerprint: "b".repeat(64),
+      }),
+    );
   });
 
   it("idempotency_key 全局唯一且非空（K-03：幂等键与指纹是两个概念）", () => {
@@ -1296,10 +1408,11 @@ describe("T-22 / B5+P15：别名唯一性的定义域", () => {
 // ── T-23 / 四.5 + K-17：授权哈希与复用键 ─────────────────────────────
 
 describe("T-23 / K-17：云端发送授权的哈希形态与逐版本复用规则", () => {
+  /** 本 describe 只探脱敏轨道（0009 之后授权键是四元组，第四腿固定 'redacted'）。 */
   function grant(id: string, payload: string, redacted: string, policy = "rules-v1"): void {
     db.prepare(
-      `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-       values (?, ?, ?, ?, ?, ?)`,
+      `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+       values (?, ?, 'redacted', ?, ?, ?, ?)`,
     ).run(id, revisionId, redacted, payload, policy, NOW);
   }
 
@@ -1317,7 +1430,7 @@ describe("T-23 / K-17：云端发送授权的哈希形态与逐版本复用规�
         grant("csg_dup_1", HEX64, "b".repeat(64));
         grant("csg_dup_2", HEX64, "b".repeat(64));
       },
-      /UNIQUE constraint failed: cloud_send_grant.record_revision_id, cloud_send_grant.payload_sha256, cloud_send_grant.policy_version/,
+      /UNIQUE constraint failed: cloud_send_grant.record_revision_id, cloud_send_grant.send_content_mode, cloud_send_grant.payload_sha256, cloud_send_grant.policy_version/,
     );
     expectAccepted(() => {
       grant("csg_policy_1", HEX64, "b".repeat(64), "rules-v1");
@@ -1331,20 +1444,20 @@ describe("T-23 / K-17：云端发送授权的哈希形态与逐版本复用规�
 
   it("逐版本授权：另一版本的载荷互不通用（不同 revision 各自成键）", () => {
     db.prepare(
-      `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-       values ('csg_v1', ?, ?, ?, 'rules-v1', ?)`,
+      `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+       values ('csg_v1', ?, 'redacted', ?, ?, 'rules-v1', ?)`,
     ).run(revisionId, HEX64, "b".repeat(64), NOW);
     expectAccepted(() =>
       db
         .prepare(
-          `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-           values ('csg_v2', ?, ?, ?, 'rules-v1', ?)`,
+          `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+           values ('csg_v2', ?, 'redacted', ?, ?, 'rules-v1', ?)`,
         )
         .run(revision2, HEX64, "b".repeat(64), NOW),
     );
   });
 
-  it("授权表不存待发送文本本体：列集合只有身份与哈希（隐私面静态断言）", () => {
+  it("授权表不存待发送文本本体：列集合只有身份、内容轴与哈希（隐私面静态断言）", () => {
     const cols = db.prepare("pragma table_info(cloud_send_grant)").all() as Array<{ name: string }>;
     expect(cols.map((c) => c.name).sort()).toEqual(
       [
@@ -1354,6 +1467,8 @@ describe("T-23 / K-17：云端发送授权的哈希形态与逐版本复用规�
         "policy_version",
         "redacted_sha256",
         "record_revision_id",
+        // 0009 的第四腿：授权针对哪种内容。它是取值标签，不是内容本体。
+        "send_content_mode",
       ].sort(),
     );
     expect(sqlCode).not.toMatch(/CREATE TABLE cloud_send_grant[\s\S]*?(raw_text|tokens|redacted_text)/);
@@ -1368,8 +1483,8 @@ describe("T-23 / K-17：云端发送授权的哈希形态与逐版本复用规�
 
   it("FK CASCADE：版本删除时其授权随之消失，不留悬空许可", () => {
     db.prepare(
-      `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-       values ('csg_cascade', ?, ?, ?, 'rules-v1', ?)`,
+      `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+       values ('csg_cascade', ?, 'redacted', ?, ?, 'rules-v1', ?)`,
     ).run(revisionId, HEX64, "b".repeat(64), NOW);
     db.exec("begin immediate");
     db.prepare("delete from record_revision where id = ?").run(revisionId);
@@ -1703,10 +1818,25 @@ describe("T-26 / P19：GraphEdge 无 directed 列，方向由关系类型与字�
     expect(countRows(db, "graph_edge")).toBe(2);
   });
 
-  it("created_by 只有用户来源：AI 直接建边在这张表里没有落点", () => {
-    expectRejected(() => insertEdge({ id: "edge_ai_1", created_by: "ai_generated" }), /CHECK constraint failed/);
-    expectRejected(() => insertEdge({ id: "edge_ai_2", created_by: "system_seed" }), /CHECK constraint failed/);
-    expectAccepted(() => insertEdge({ id: "edge_user_confirmed", created_by: "user_confirmed_suggestion" }));
+  it("created_by 的取值面恰好是三个来源；system_seed、空串、大小写与尾空格变体仍被 CHECK 拒", () => {
+    // 改向〔M7-1，裁决 R1〕：0011 放开了 `ai_generated`（抽取结果直接入库，不等用户点头），
+    // 所以这一列的契约不再是「AI 没有落点」，而是「落点恰好三个、别的来源一个都不给」。
+    // 代价写在存储层：`ai_may_never_create`（`triggered_by` / `same_as` / `merged_into`）是
+    // 「类型 × 来源」的交叉约束，单列 CHECK 表达不了，库里现在物理上写得进
+    // `same_as + ai_generated` 这一行。那一道守门改由 `src/server/graph/store.ts` 的
+    // `AI_NEVER_CREATE` 接管，断言见 `tests/m7-1-graph-contract.test.ts` §I（K-18 一节）。
+    const creators = ["user", "user_confirmed_suggestion", "ai_generated"];
+    expect(liveInList("graph_edge", "created_by")).toEqual(creators);
+    creators.forEach((creator, index) => {
+      expectAccepted(() => insertEdge({ id: `edge_by_${index}`, created_by: creator }));
+    });
+    const badCreators = ["system_seed", "", "AI_GENERATED", "Ai_generated", "ai_generated ", " ai_generated", "user_confirmed"];
+    badCreators.forEach((bad, index) => {
+      expectRejected(
+        () => insertEdge({ id: `edge_by_bad_${index}`, created_by: bad }),
+        /CHECK constraint failed/,
+      );
+    });
   });
 });
 

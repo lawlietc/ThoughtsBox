@@ -301,12 +301,14 @@ describe("T-04 崩溃幂等：真实子进程异常退出后的同键重放", ()
     expect(countRows(db, "parse_run")).toBe(1);
 
     // 换 prompt 版本 = 新管线（§8.3）：新指纹、新行，两条 live run 并存。
+    // 这里要的是一个与默认值**不同**的版本串，别写真实版本号：DEFAULT_PROMPT_VERSION
+    // 一升到该值，两次请求就变回同一条管线，被认成重放，断言静默失效。
     const second = new IngestService({
       db,
       adapter: makeAdapter(),
       transport: stub.transport,
       systemPrompt: SYSTEM_PROMPT,
-      promptVersion: "m2-prompt-v2",
+      promptVersion: "test-prompt-next",
     });
     const b = await second.ingest({ recordRevisionId: revisionId });
     expect(b.runId).not.toBe(a.runId);

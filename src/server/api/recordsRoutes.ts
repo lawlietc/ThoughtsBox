@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { z } from "zod";
 
+import { ThreeAxisCombinationError, ThreeAxisValueError } from "../../shared/contracts/enums.ts";
 import {
   InvalidProcessingModeError,
   RecordNotFoundError,
@@ -17,6 +18,9 @@ const textBody = z.object({ text: z.string() }).strict();
 // 这里不重抄字面量（zod 只保证是字符串）。
 const createBody = textBody.extend({ processing_mode: z.string().optional() });
 const modeBody = z.object({ processing_mode: z.string() }).strict();
+// M9-4d-2（裁决 M9-D-15）：只改脱敏档的那一条窄入口。`redaction` 与 `processing` 是两个字段，
+// 请求体里出现别的键一律拒（`.strict()`）——「顺手改另一轴」在这条路由上不可能发生。
+const redactionModeBody = z.object({ redaction_mode: z.string() }).strict();
 const listQuery = z.object({ limit: z.coerce.number().int().optional(), offset: z.coerce.number().int().optional() });
 
 export class BodyTooLargeError extends Error {}
@@ -68,6 +72,12 @@ export async function handleRecordsRequest(
       send(400, { error: "invalid_request", detail: cause.message, issues: [...cause.issues] });
     } else if (cause instanceof RecordValidationError) {
       send(400, { error: "invalid_request", detail: cause.message });
+    } else if (cause instanceof ThreeAxisValueError) {
+      // 脱敏档取值不在册 ⇒ 400。消息只带字段名与封闭清单的标签，不带任何原值（§11.2 同取向）。
+      send(400, { error: "invalid_request", detail: cause.message, issues: [cause.field] });
+    } else if (cause instanceof ThreeAxisCombinationError) {
+      // 改后三轴组合不成立 ⇒ 400，服务层已在任何写语句之前抛出，库里逐字未变。
+      send(400, { error: "invalid_request", detail: cause.message });
     } else if (cause instanceof RecordNotFoundError) {
       send(404, { error: "not_found" });
     } else if (cause instanceof RecordStateConflictError) {
@@ -111,6 +121,18 @@ export async function handleRecordsRequest(
       if (method === "PATCH") {
         const parsed = modeBody.parse(await readJsonBody(req));
         send(200, records.setProcessingMode(id, parsed.processing_mode));
+        return true;
+      }
+    }
+
+    // M9-4d-2：换脱敏档。与上面 `/mode` 同一种路径解析手法，也是同一取向——PUT 那个位子已经
+    // 承载「改原文」的全量替换语义，这里只动一列，是部分更新。
+    const redactionModeMatch = /^\/api\/records\/([^/]+)\/redaction-mode$/.exec(path);
+    if (redactionModeMatch) {
+      const id = redactionModeMatch[1]!;
+      if (method === "PATCH") {
+        const parsed = redactionModeBody.parse(await readJsonBody(req));
+        send(200, records.setRedactionMode(id, parsed.redaction_mode));
         return true;
       }
     }

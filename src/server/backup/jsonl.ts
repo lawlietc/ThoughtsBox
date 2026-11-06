@@ -4,6 +4,14 @@ import { z } from "zod";
 
 import { loadEnums } from "../../shared/contracts/load.ts";
 import { hasPrefix } from "../../shared/contracts/ids.ts";
+import {
+  assertThreeAxes,
+  axesForProcessingMode,
+  coerceAxes,
+  deriveProcessingMode,
+  isProcessingModeValue,
+  type ThreeAxes,
+} from "../../shared/contracts/enums.ts";
 import { serializeTokens, tokenize } from "../../shared/search/tokenizer.ts";
 import type { Database } from "../db/adapter.ts";
 import { currentSchemaVersion, listMigrationFiles } from "../db/migrator.ts";
@@ -47,7 +55,15 @@ const RECORD_COLUMNS = [
   "processing_status",
   "processing_mode",
   "privacy_level",
+  // 三轴随导出（草案 §八之二-4 的裁决）：派生是**有损**的——`local+manual` 与
+  // `local+local_llm` 都派生成 `local_model`，只带 `processing_mode` 的备份换机后反推不回原值。
+  "analysis_provider",
+  "redaction_mode",
+  "send_content_mode",
 ] as const;
+
+/** 导出行的列名集合（`toRecordRow` 与本清单逐键对齐，少一个键即编译不过）。 */
+type RecordColumn = (typeof RECORD_COLUMNS)[number];
 
 const REVISION_COLUMNS = [
   "id",
@@ -110,6 +126,12 @@ const recordLineSchema = z
     processing_status: closedEnum(enums.processing_statuses, "processing_status"),
     processing_mode: closedEnum(enums.processing_modes, "processing_mode"),
     privacy_level: closedEnum(enums.privacy_levels, "privacy_level"),
+    // 三轴可选**只为兼容**：0008 之前生成的 v1 导出文件里没有这三键，那份文件里的
+    // `processing_mode` 只可能是旧三值，按草案 §四 的旧值映射反推是无损的。
+    // 新导出的行三轴齐全；契约版本仍是 1（加键、且读侧宽容，不是一次破坏性变更）。
+    analysis_provider: closedEnum(enums.analysis_providers, "analysis_provider").optional(),
+    redaction_mode: closedEnum(enums.redaction_modes, "redaction_mode").optional(),
+    send_content_mode: closedEnum(enums.send_content_modes, "send_content_mode").optional(),
   })
   .strict();
 
@@ -160,8 +182,84 @@ export function exportJsonl(
 }
 
 interface ParsedImport {
-  readonly records: Array<{ lineNo: number; data: z.infer<typeof recordLineSchema> }>;
+  readonly records: ParsedRecord[];
   readonly revisions: Array<{ lineNo: number; data: z.infer<typeof revisionLineSchema> }>;
+}
+
+/** 一条 `capture_record` 行的解析产物：核对过的三轴 + 可直接落库的具名列值。 */
+interface ParsedRecord {
+  readonly lineNo: number;
+  readonly data: z.infer<typeof recordLineSchema>;
+  readonly axes: ThreeAxes;
+  readonly row: Record<RecordColumn, string>;
+}
+
+const AXIS_COLUMNS = ["analysis_provider", "redaction_mode", "send_content_mode"] as const;
+
+/**
+ * 行里的三轴 → 核对过的 `ThreeAxes` + 插入用列值。三件核对各自独立成立：
+ *
+ * 1. **取值在封闭集**（schema 判过一道，`coerceAxes` 再判一道——两道都不静默兜底）。
+ * 2. **组合合法**（草案 §三 矩阵）：库里两条表级 CHECK 也会拒，但 COMMIT 阶段的报错没有行号；
+ *    在这里判，问题才归到「第 N 行」，整批仍然零写入。
+ * 3. **派生一致**（§七 断言 2）：`processing_mode` 必须等于三轴的派生结果。不一致说明这份文件
+ *    被手改过，或来自语义不同的另一份契约。
+ *
+ * 三键**同时缺席**是 0008 之前的旧文件：按 §四 旧值映射反推。那份文件里的 `processing_mode`
+ * 只可能是旧三值（当时的 CHECK 就钉在三值内），反推因此是无损的；部分缺席没有可信的映射，拒。
+ */
+function normalizeRecordLine(
+  data: z.infer<typeof recordLineSchema>,
+  lineNo: number,
+  issues: string[],
+): ParsedRecord | null {
+  const present = AXIS_COLUMNS.filter((column) => data[column] !== undefined);
+  let axes: ThreeAxes | null = null;
+  if (present.length === AXIS_COLUMNS.length) {
+    try {
+      axes = coerceAxes(
+        data.analysis_provider as string,
+        data.redaction_mode as string,
+        data.send_content_mode as string,
+      );
+      assertThreeAxes(axes);
+    } catch (cause) {
+      issues.push(`第 ${lineNo} 行：${(cause as Error).message}`);
+      return null;
+    }
+    const derived = deriveProcessingMode(axes);
+    if (derived !== data.processing_mode) {
+      issues.push(
+        `第 ${lineNo} 行：processing_mode=${data.processing_mode} 与三轴的派生结果 ${derived} 不一致（草案 §五）`,
+      );
+      return null;
+    }
+  } else if (present.length === 0) {
+    if (!isProcessingModeValue(data.processing_mode)) {
+      issues.push(`第 ${lineNo} 行：三轴缺席时 processing_mode 必须可映射（${data.processing_mode} 不在册）`);
+      return null;
+    }
+    axes = axesForProcessingMode(data.processing_mode);
+  } else {
+    issues.push(`第 ${lineNo} 行：三轴必须同时出现或同时缺席，现状为 ${present.join(" / ")}`);
+    return null;
+  }
+
+  const row: Record<RecordColumn, string> = {
+    id: data.id,
+    created_at_utc: data.created_at_utc,
+    created_at_local: data.created_at_local,
+    timezone_id: data.timezone_id,
+    created_local_date: data.created_local_date,
+    current_revision_id: data.current_revision_id,
+    processing_status: data.processing_status,
+    processing_mode: data.processing_mode,
+    privacy_level: data.privacy_level,
+    analysis_provider: axes.analysisProvider,
+    redaction_mode: axes.redactionMode,
+    send_content_mode: axes.sendContentMode,
+  };
+  return { lineNo, data, axes, row };
 }
 
 // M1b：导入结果类型上收为前后端共用契约；re-export 保持既有导入路径可用。
@@ -291,7 +389,8 @@ export function importJsonl(db: Database, text: string): ImportResult {
         }
         return;
       }
-      parsed.records.push({ lineNo, data: result.data });
+      const normalized = normalizeRecordLine(result.data, lineNo, issues);
+      if (normalized !== null) parsed.records.push(normalized);
       return;
     }
     if (kind === "record_revision") {
@@ -326,7 +425,7 @@ export function importJsonl(db: Database, text: string): ImportResult {
       `insert into record_revision (${REVISION_COLUMNS.join(", ")}) values (${REVISION_COLUMNS.map(() => "?").join(", ")})`,
     );
     for (const item of parsed.records) {
-      insertRecord.run(...RECORD_COLUMNS.map((column) => item.data[column]));
+      insertRecord.run(...RECORD_COLUMNS.map((column) => item.row[column]));
     }
     for (const item of parsed.revisions) {
       insertRevision.run(...REVISION_COLUMNS.map((column) => item.data[column]));

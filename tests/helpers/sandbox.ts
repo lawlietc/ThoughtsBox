@@ -86,6 +86,8 @@ const KNOWN_TABLES = new Set([
   "user_collection_patch",
   // M3（0007）§3.16 触发认定表。
   "trigger_assertion",
+  // M6-0E（0010）后台任务队列的调度表。
+  "privacy_job",
 ]);
 
 export function countRows(db: Database, table: string): number {

@@ -121,9 +121,11 @@ function insertGrantRow(
   policy: string,
   redactedSha = HEX64,
 ): void {
+  // 本夹具只造脱敏轨道的行；0009 之后授权键是四元组，第四腿固定 'redacted'。
+  // 原文轨道的授权面见 tests/m6-0d-raw-grant.test.ts。
   run(
-    `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-     values (?, ?, ?, ?, ?, ?)`,
+    `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+     values (?, ?, 'redacted', ?, ?, ?, ?)`,
     [id, revision, redactedSha, payloadSha, policy, NOW],
   );
 }
@@ -294,7 +296,7 @@ describe("T-33：fingerprint 与 redactionMap 的关系成立", () => {
       model: "qwen2.5:14b",
       provider: "manual_only",
       params: { temperature: 1 },
-      redaction: "rules-v2",
+      redaction: "rules-v3",
       resolver: "resolver-v2",
       validation: "validation-v2",
     };
@@ -538,6 +540,9 @@ describe("K-23/B9：偏移锚定 raw_text，单位是 UTF-16 code unit", () => {
     expect(REDACTION_KINDS).toEqual([
       "phone",
       "email",
+      "id_number",
+      "bank_card",
+      "secret",
       "person",
       "organization",
       "place",
@@ -554,7 +559,7 @@ describe("K-23/B9：偏移锚定 raw_text，单位是 UTF-16 code unit", () => {
     insertAlias("entity_zhang", "张三生");
     insertEntity("entity_store", "organization", "蓝山咖啡馆", "蓝山");
     const entities = collectKnownEntities(db);
-    expect(entities).toEqual([
+    expect(entities).toMatchObject([
       { entityId: "entity_store", entityType: "organization", terms: ["蓝山咖啡馆", "蓝山"] },
       { entityId: "entity_zhang", entityType: "person", terms: ["张三", "张三生"] },
     ]);
@@ -592,7 +597,7 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     expect(countRows(db, "cloud_send_grant")).toBe(0);
     let gate: unknown;
     try {
-      grants.requireApplicableGrant(preview.recordRevisionId, preview.payloadSha256, preview.policyVersion);
+      grants.requireApplicableGrant(preview.recordRevisionId, preview.payloadSha256, preview.policyVersion, "redacted");
     } catch (cause) {
       gate = cause;
     }
@@ -625,12 +630,12 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     expect(nextPreview.recordRevisionId).not.toBe(revisionId);
 
     expectThrown(
-      () => grants.requireApplicableGrant(edited.revision.id, nextPreview.payloadSha256, nextPreview.policyVersion),
+      () => grants.requireApplicableGrant(edited.revision.id, nextPreview.payloadSha256, nextPreview.policyVersion, "redacted"),
       /没有适用授权/,
     );
     // 旧行仍在库里可追溯，但它绑的是旧 revision，不构成对新版本的许可
-    expect(grants.findApplicableGrant(edited.revision.id, nextPreview.payloadSha256, nextPreview.policyVersion)).toBeNull();
-    expect(grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion).id).toBe(grant.id);
+    expect(grants.findApplicableGrant(edited.revision.id, nextPreview.payloadSha256, nextPreview.policyVersion, "redacted")).toBeNull();
+    expect(grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion, "redacted").id).toBe(grant.id);
     // 新版本自己签发才有授权
     const fresh = grants.issueGrant(nextPreview);
     expect(fresh.record_revision_id).toBe(edited.revision.id);
@@ -641,7 +646,7 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     const preview = grants.preparePreview(revisionId, { entities: [ENTITY_ZHANG], nonce: NONCE });
     grants.issueGrant(preview, { confirmedAtUtc: NOW });
     expectThrown(
-      () => grants.requireApplicableGrant(revisionId, sha256OfText("换了别的载荷"), preview.policyVersion),
+      () => grants.requireApplicableGrant(revisionId, sha256OfText("换了别的载荷"), preview.policyVersion, "redacted"),
       /没有适用授权/,
     );
   });
@@ -650,13 +655,13 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     const preview = grants.preparePreview(revisionId, { entities: [ENTITY_ZHANG], nonce: NONCE });
     const grant = grants.issueGrant(preview, { confirmedAtUtc: NOW });
     expectThrown(
-      () => grants.requireApplicableGrant(revisionId, preview.payloadSha256, "rules-v2"),
+      () => grants.requireApplicableGrant(revisionId, preview.payloadSha256, "rules-v3", "redacted"),
       /没有适用授权/,
     );
     // 策略升版后另建一行是合法的（复用键含 policy_version）
-    insertGrantRow("csg_policy_v2", revisionId, preview.payloadSha256, "rules-v2");
-    expect(grants.requireApplicableGrant(revisionId, preview.payloadSha256, "rules-v2").policy_version).toBe("rules-v2");
-    expect(grants.findApplicableGrant(revisionId, preview.payloadSha256, REDACTION_POLICY_VERSION)?.id).toBe(grant.id);
+    insertGrantRow("csg_policy_v3", revisionId, preview.payloadSha256, "rules-v3");
+    expect(grants.requireApplicableGrant(revisionId, preview.payloadSha256, "rules-v3", "redacted").policy_version).toBe("rules-v3");
+    expect(grants.findApplicableGrant(revisionId, preview.payloadSha256, REDACTION_POLICY_VERSION, "redacted")?.id).toBe(grant.id);
   });
 
   it("不适用三：记录硬删除后授权随行消失，闸门依旧抛（FK CASCADE 的服务面）", () => {
@@ -665,7 +670,7 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     records.deleteRecord(preview.recordId);
     expect(countRows(db, "cloud_send_grant")).toBe(0);
     expectThrown(
-      () => grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion),
+      () => grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion, "redacted"),
       /没有适用授权/,
     );
     expectThrown(() => grants.preparePreview(revisionId), /记录版本不存在/);
@@ -687,7 +692,7 @@ describe("CloudSendGrant 签发、复用与不适用（K-17）", () => {
     expect(grant.payload_sha256).toBe(sha256OfText(editedText));
     // 未替换的那份载荷没有授权：先签替换版，再拿原版去要
     expectThrown(
-      () => grants.requireApplicableGrant(revisionId, base.payloadSha256, base.policyVersion),
+      () => grants.requireApplicableGrant(revisionId, base.payloadSha256, base.policyVersion, "redacted"),
       /没有适用授权/,
     );
     // 替换掉的位置仍在映射里，但实际发送文本已与之不符 ⇒ 核验不通过，返回 null
@@ -718,7 +723,7 @@ describe("禁区：脱敏后的文本不得回写原始记录", () => {
     const pure = redact(RAW, collectKnownEntities(db));
     const preview = grants.preparePreview(revisionId, { entities: [ENTITY_ZHANG, ENTITY_LAOZHOU], nonce: NONCE });
     grants.issueGrant(preview);
-    grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion);
+    grants.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion, "redacted");
 
     expect(snapshot(RECORD_TABLES)).toBe(before);
     expect(countRows(db, "record_revision")).toBe(beforeCount);
@@ -761,13 +766,15 @@ describe("禁区：脱敏后的文本不得回写原始记录", () => {
         return false;
       }
     });
-    // 授权表只有六列身份/哈希，脱敏文本本体不落任何表
+    // 授权表只有七列身份/内容轴/哈希，脱敏文本本体不落任何表
     expect(carriers).toEqual([]);
     const columns = db.prepare("pragma table_info(cloud_send_grant)").all() as Array<{ name: string }>;
-    // 六列身份/哈希，顺序按 DDL 读；比对时两边都排序，钉的是集合不是排列
+    // 七列身份/内容轴/哈希，顺序按 DDL 读；比对时两边都排序，钉的是集合不是排列。
+    // send_content_mode（0009）是「这条授权属于哪条外发轨道」的取值标签，不是内容本体。
     expect(columns.map((c) => c.name)).toEqual([
       "id",
       "record_revision_id",
+      "send_content_mode",
       "redacted_sha256",
       "payload_sha256",
       "policy_version",
@@ -781,6 +788,7 @@ describe("禁区：脱敏后的文本不得回写原始记录", () => {
         "policy_version",
         "record_revision_id",
         "redacted_sha256",
+        "send_content_mode",
       ].sort(),
     );
     const stored: CloudSendGrantRow = db
@@ -802,9 +810,9 @@ describe("禁区：授权不得跨记录、跨版本复用", () => {
     expect(previewA.map.nonce).toBe(previewB.map.nonce);
 
     const grantA = grants.issueGrant(previewA, { confirmedAtUtc: NOW });
-    expect(grants.findApplicableGrant(b.revision.id, previewB.payloadSha256, previewB.policyVersion)).toBeNull();
+    expect(grants.findApplicableGrant(b.revision.id, previewB.payloadSha256, previewB.policyVersion, "redacted")).toBeNull();
     expectThrown(
-      () => grants.requireApplicableGrant(b.revision.id, previewB.payloadSha256, previewB.policyVersion),
+      () => grants.requireApplicableGrant(b.revision.id, previewB.payloadSha256, previewB.policyVersion, "redacted"),
       /没有适用授权/,
     );
     // 逐记录逐版本：B 自己签发不被唯一键挡住
@@ -818,8 +826,8 @@ describe("禁区：授权不得跨记录、跨版本复用", () => {
     const a = records.createRecord(RAW).revision.id;
     const b = records.createRecord(RAW).revision.id;
     insertGrantRow("csg_for_a", a, HEX64, REDACTION_POLICY_VERSION);
-    expect(grants.findApplicableGrant(b, HEX64, REDACTION_POLICY_VERSION)).toBeNull();
-    expect(grants.requireApplicableGrant(a, HEX64, REDACTION_POLICY_VERSION).id).toBe("csg_for_a");
+    expect(grants.findApplicableGrant(b, HEX64, REDACTION_POLICY_VERSION, "redacted")).toBeNull();
+    expect(grants.requireApplicableGrant(a, HEX64, REDACTION_POLICY_VERSION, "redacted").id).toBe("csg_for_a");
     expectAccepted(() => insertGrantRow("csg_for_b", b, HEX64, REDACTION_POLICY_VERSION));
     expectRejected(
       () => insertGrantRow("csg_for_a2", a, HEX64, REDACTION_POLICY_VERSION),

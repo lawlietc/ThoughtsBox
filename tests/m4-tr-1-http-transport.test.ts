@@ -12,11 +12,17 @@ import {
   type ModelAdapter,
 } from "../src/server/ingest/provider.ts";
 import { structuredOutputSchema } from "../src/server/ingest/contract.ts";
-import { M2_PROMPT_CONTRACT_FIELDS, M2_PROMPT_V1 } from "../src/server/ingest/prompts/m2-prompt-v1.ts";
+import {
+  DEFAULT_OUTPUT_SCHEMA_VERSION,
+  DEFAULT_PROMPT_VERSION,
+} from "../src/server/ingest/ingestService.ts";
+import { M2_PROMPT_V2_CONTRACT_FIELDS, M2_PROMPT_V2 } from "../src/server/ingest/prompts/m2-prompt-v2.ts";
 import { serializeTrace, TracePrivacyViolation } from "../src/server/ingest/trace.ts";
 import { buildProductionProvider } from "../src/server/runtime/productionProvider.ts";
 import { loadConfigFromPath, parseAppConfig, TEMPLATE_CONFIG_PATH, type AppConfig } from "../src/server/config/config.ts";
 import { ConfigError } from "../src/server/config/errors.ts";
+import { DEFAULT_API_KEY_ENV } from "../src/shared/constants/model.ts";
+import { axesForProcessingMode } from "../src/shared/contracts/enums.ts";
 import { envelopeOf, validOutput } from "./helpers/ingestFixtures.ts";
 
 /**
@@ -87,6 +93,7 @@ const openEndpoints: FakeEndpoint[] = [];
 afterEach(async () => {
   while (openEndpoints.length > 0) await openEndpoints.pop()!.close();
   delete process.env[KEY_ENV];
+  delete process.env[DEFAULT_API_KEY_ENV];
 });
 
 async function tracked(responder: Parameters<typeof startFakeEndpoint>[0]): Promise<FakeEndpoint> {
@@ -98,6 +105,8 @@ async function tracked(responder: Parameters<typeof startFakeEndpoint>[0]): Prom
 function makeRequest(overrides: Partial<ExtractionRequest> = {}): ExtractionRequest {
   return {
     recordRevisionId: "rev_test_1",
+    // 三轴是判定源（草案 §二）：夹具按既有模式反推，本次调用的语义与改动前逐字相同。
+    axes: axesForProcessingMode("local_model"),
     processingMode: "local_model",
     payloadText: "今天和项目组的同事讨论了发布计划，我感到焦虑",
     systemPrompt: "你是抽取器。",
@@ -264,11 +273,18 @@ describe("M4-TR-1 密钥零泄露（哨兵串当 key）", () => {
     ).toThrow(TracePrivacyViolation);
   });
 
-  it("装配出的 adapter 只含变量名，序列化面不含哨兵", () => {
-    process.env[KEY_ENV] = SENTINEL;
-    const bundle = buildProductionProvider(modelEnabledConfig({ model: "m", call_path: "ollama_openai_compatible", api_key_env: KEY_ENV }), process.env);
+  it("装配出的 adapter 固定使用默认变量名，序列化面不含哨兵", () => {
+    process.env[DEFAULT_API_KEY_ENV] = SENTINEL;
+    const bundle = buildProductionProvider(
+      modelEnabledConfig({
+        model: "m",
+        call_path: "ollama_openai_compatible",
+        api_key_env: KEY_ENV,
+      }),
+      process.env,
+    );
     expect(bundle).not.toBeNull();
-    expect(bundle!.adapter.apiKeyEnv).toBe(KEY_ENV);
+    expect(bundle!.adapter.apiKeyEnv).toBe(DEFAULT_API_KEY_ENV);
     expect(JSON.stringify(bundle!.adapter)).not.toContain(SENTINEL);
   });
 });
@@ -337,7 +353,7 @@ describe("M4-TR-1 buildProductionProvider", () => {
     expect(bundle!.adapter.callPath).toBe("ollama_openai_compatible");
     expect(bundle!.adapter.supportsStructuredOutput).toBe(true);
     expect(bundle!.adapter.params).toEqual({ temperature: 0.2 });
-    expect(bundle!.systemPrompt).toBe(M2_PROMPT_V1);
+    expect(bundle!.systemPrompt).toBe(M2_PROMPT_V2);
     expect(bundle!.transport).toBe(httpTransport);
   });
 
@@ -387,7 +403,7 @@ describe("M4-TR-1 buildProductionProvider", () => {
 
 // ── 四、提示词 ↔ contract 字段表对账 ──────────────────────────────
 
-describe("M4-TR-1 生产提示词 ↔ m2-output-v1 对账", () => {
+describe("M4-TR-1 生产提示词 ↔ m2-output-v2 对账", () => {
   /** 递归收集 zod 生成的 JSON Schema 里所有 properties 键名 = 契约字段全集。 */
   function collectPropertyNames(node: unknown, out: Set<string>): void {
     if (Array.isArray(node)) {
@@ -408,9 +424,9 @@ describe("M4-TR-1 生产提示词 ↔ m2-output-v1 对账", () => {
     const json = z.toJSONSchema(structuredOutputSchema, { io: "output", target: "draft-2020-12" });
     const contractFields = new Set<string>();
     collectPropertyNames(json, contractFields);
-    const promptListed = new Set<string>(M2_PROMPT_CONTRACT_FIELDS);
+    const promptListed = new Set<string>(M2_PROMPT_V2_CONTRACT_FIELDS);
     // 提示词清单覆盖的每个字段都得出现在正文里。
-    for (const field of promptListed) expect(M2_PROMPT_V1.includes(`"${field}"`)).toBe(true);
+    for (const field of promptListed) expect(M2_PROMPT_V2.includes(`"${field}"`)).toBe(true);
     // 双向对账：契约有而清单漏 = 0；清单有而契约无 = 0。
     const missing = [...contractFields].filter((f) => !promptListed.has(f));
     const extra = [...promptListed].filter((f) => !contractFields.has(f));
@@ -419,13 +435,18 @@ describe("M4-TR-1 生产提示词 ↔ m2-output-v1 对账", () => {
   });
 
   it("封闭枚举取值写进正文", () => {
-    for (const v of ["explicit", "inferred"]) expect(M2_PROMPT_V1).toContain(v);
-    for (const v of ["year", "month", "day", "unknown"]) expect(M2_PROMPT_V1).toContain(v);
-    for (const v of ["approximate"]) expect(M2_PROMPT_V1).toContain(v);
+    for (const v of ["explicit", "inferred"]) expect(M2_PROMPT_V2).toContain(v);
+    for (const v of ["year", "month", "day", "unknown"]) expect(M2_PROMPT_V2).toContain(v);
+    for (const v of ["approximate"]) expect(M2_PROMPT_V2).toContain(v);
   });
 
-  it("版本串沿用 m2-prompt-v1 不升", () => {
-    // DEFAULT_PROMPT_VERSION 保持 m2-prompt-v1（升版会动 K-17 指纹面）。
-    expect(M2_PROMPT_V1.length).toBeGreaterThan(200);
+  it("版本串随 relations 键升到 v2：默认串与生产提示词同源", () => {
+    // 〔M7-2，准则 §3.3〕输出契约多了 `relations` 键 ⇒ 另一条管线，两个默认串一起升；
+    // K-17 指纹随版本串变化正是升版要的效果（旧 run 不会被新 run 顶掉）。
+    // 这不是放宽：M4-TR-1 当年只断「提示词非空」（`length > 200`），这里断的是**当前的具体值**，
+    // 少一个字节就红，两句并存。
+    expect(DEFAULT_PROMPT_VERSION).toBe("m2-prompt-v2");
+    expect(DEFAULT_OUTPUT_SCHEMA_VERSION).toBe("m2-output-v2");
+    expect(M2_PROMPT_V2.length).toBeGreaterThan(200);
   });
 });

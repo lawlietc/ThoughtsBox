@@ -14,6 +14,13 @@ import {
   SUGGESTIONS_UNREADY,
 } from "../src/web/projectionPort.ts";
 
+import {
+  INGEST_STAGE_ACTION as ingestStageActions,
+  INGEST_STAGE_LABEL,
+  stagePrimaryEnabled,
+} from "../src/web/ingestStage.ts";
+import { MODE_LABEL } from "../src/web/ui/labels.ts";
+
 /**
  * M5-3A · Web UI 文案降噪与信息分层（批次 A：基础设施 + 核心页面）。
  *
@@ -147,21 +154,22 @@ describe("M5-3A · QuickPanel", () => {
     expect(quick).not.toContain("内容不出本机：保存后进「待整理」；也可以在这里直接「保存并整理」。");
   });
 
-  it("三种模式收进一行折叠说明，主层不再渲染长行动解释", () => {
-    const picker = visibleCopy("ui/ProcessingModePicker.tsx");
+  // 〔2026-11-06 用户裁定〕写入页恢复四档选择器；初始档位与设置页、睡前页共用同一个默认值。
+  // 不削弱的是同一件事——写入页没有长行动解释，模式语义由选择器承担，而写入路径的时序
+  //（原文先落盘）继续由 `quickSave.ts` 钉住。
+  it("写入页渲染模式选择器；初始档位来自共用的默认值，不摆长行动解释", () => {
     expect(quick).toContain("<ProcessingModePicker");
-    expect(picker).toContain("整理方式：");
-    expect(picker).toContain("<details className=\"quick-mode\">");
-    expect(picker).toContain("只保存在本机");
-    expect(picker).toContain("先保存，需要时在本机整理");
-    expect(picker).toContain("保存后去确认发送");
+    expect(quick).toContain("resolveEntryMode(cfg.processingDefaults.recordDefaultMode, cfg.processingAvailability)");
     expect(quick).not.toContain("MODE_ACTION_NOTE");
   });
 
-  it("行为语义原样保留：先保存原文、本机模型、不自动发送、逐次确认", () => {
-    expect(quick).toContain("quickSecondActionFor(mode)");
+  it("行为语义原样保留：先保存原文、第二动作只入队、不自动发送、逐次确认", () => {
+    // 第二颗牌由 `quickSecondActionFor(mode)` 给出（manual_only 没有第二动作）。
+    expect(quick).toContain("const second = quickSecondActionFor(mode);");
     expect(quick).toContain('busy === "save" ? "保存中…"');
-    expect(quick).toContain("api.ingestParse");
+    // 〔整理方式改动〕第二动作从「本页同步跑模型」改成「排进后台队列」：这一页对模型的调用点归零。
+    expect(quick).toContain("api.enqueueJob");
+    expect(quick).not.toContain("api.ingestParse");
     expect(quick).not.toMatch(/\bapi\.ingest(Reparse|Preview|ConfirmSend)\b/);
   });
 });
@@ -172,8 +180,12 @@ describe("M5-3A · IngestPanel 主可见区", () => {
   const ingest = visibleCopy("IngestPanel.tsx");
 
   it("待整理引导压成一句，「为什么不在这里」缩成一行且不再列清单", () => {
-    expect(ingest).toContain("待发送、待重跑和整理失败的记录都在这里。");
-    expect(ingest).toContain("只保存的记录不会进入待整理。");
+    // 〔web-redesign 有意变动 · 理由单列在 2026-11-02 工作日志〕页首导语「待发送、待重跑和整理失败的
+    // 记录都在这里。不推送、不催办。」整句退出：三种状态已逐行显示在列表 meta 里，「不推送」由发送
+    // 闸门那三条逐字钉住的判据（逐条确认 / 不做默认勾选 / 改动原文即失效）负责，不靠这句导语自述。
+    // 〔S5〕唯一收件箱只列「此刻需要动作」的记录，所以那句底部说明也重述为「只保存的记录不进这里」。
+    // 不削弱：它仍留在主可见区、仍回答「我那条只保存的记录去哪了」，并给出下一步。
+    expect(ingest).toContain("只保存的记录不进这里；在记录详情里可以单独整理。");
     expect(ingest).not.toContain("为什么不在这里");
     expect(ingest).not.toContain("最近");
   });
@@ -198,34 +210,56 @@ describe("M5-3A · 云端发送闸门（最需要谨慎降噪的地方）", () =
   const ingest = visibleCopy("IngestPanel.tsx");
   const folded = foldedCopy("IngestPanel.tsx");
 
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-04-web-redesign-第三步-待整理操作框重设计实施.md〕
+  // 第三步把这块的小标从「这才是实际发出去的文本」收成「实际发送文本」——同一句话的短版，
+  // 位置没变（仍压在 payload 上方）。判据因此钉**新的那一句**，更硬的那条（`<pre>` 直接可见）原样保留。
   it("实际待发送文本仍然直接渲染在主可见区，没有只藏进折叠区", () => {
     expect(ingest).toContain("<pre className=\"record-text\">{preview.payloadText}</pre>");
-    expect(ingest).toContain("这才是");
-    expect(ingest).toContain("实际发出去的文本");
+    expect(ingest).toContain("实际发送文本");
     expect(folded).not.toContain("payloadText");
   });
 
-  it("候选风险、脱敏不等于匿名化、授权状态与确认/取消按钮全部保持直接可见", () => {
-    expect(ingest).toContain("原样发出去");
-    expect(ingest).toContain("跳过 = 不遮 = 风险自负");
+  // 〔web-redesign 有意变动 · 同一条理由〕
+  // 第三步把这些危险信息搬到了**决策点**：勾/取消一个词的地方是那个弹窗
+  // （`ui/SendReviewDialog.tsx`），所以「原样发出去」「跳过 = 不遮 = 风险自负」
+  // 「脱敏不等于匿名化」现在住在那儿 —— 字一个没少，位置更对。
+  // 「这份发送内容已确认过 / 还没有确认」不再单独成句：两种阶段名各自说了这件事。
+  it("遮蔽清单、脱敏不等于匿名化、授权状态与确认/取消按钮全部保持可见", () => {
+    const review = visibleCopy("ui/SendReviewDialog.tsx");
+    expect(review).toContain("脱敏了");
+    expect(review).toContain("原文对不上");
+    expect(review).toContain("RAW_TRACK_REVIEW_NOTE");
     expect(ingest).toContain("脱敏");
-    expect(ingest).toContain("匿名化");
+    // 〔web-redesign 第三步〕那句话随那两组单选搬进「发送方式」弹窗（它解释遮蔽质量，
+    // 该站在做那个选择的地方）。判据跟着落到 `ui/SendMethodDialog.tsx`。
+    expect(visibleCopy("ui/SendMethodDialog.tsx")).toContain("匿名化");
     expect(ingest).toContain("确认本次发送内容");
-    expect(ingest).toContain("确认，就按这份内容发送");
+    // Phase B：确认与整理合并，按钮不再是「确认，就按这份内容发送」。
+    expect(ingest).toContain('track === "raw" ? "确认原文并整理" : "确认并整理"');
     expect(ingest).toContain("再想想");
-    expect(ingest).toContain("这份发送内容已确认过");
-    expect(ingest).toContain("这份发送内容还没有确认");
+    // 授权状态由阶段名承担（判据直读那张表，比在两处抄同一句话硬）。
+    expect(INGEST_STAGE_LABEL["needs-grant"]).toBe("等你确认");
+    expect(INGEST_STAGE_LABEL.ready).toBe("可以整理");
     expect(ingest).toContain("改动原文后，这条授权立即失效");
-    expect(ingest).toContain("缺本次发送授权");
+    // S5/S7 之后「缺本次发送授权」不再单独成句：阶段名（`needs-grant` = 等你确认）就是这句话。
+    // 判据换成钉住那条唯一的来源，比在两处抄同一句话硬。
+    expect(ingest).toContain("INGEST_STAGE_LABEL[stage]");
+    expect(ingest).not.toContain("缺本次发送授权");
   });
 
+  // 〔web-redesign 第三步〕技术详情随「发送方式」搬进一层弹窗（`ui/SendMethodDialog.tsx`）。
+  // 判据从「IngestPanel 的折叠件里有」换成「弹窗里有 + IngestPanel 一个都没有」——
+  // 后一条是原来就有的，前一条改成落在新位置，并且多钉一头（仍走 `<TechnicalDetails>`）。
   it("策略版本、载荷指纹、授权时间进技术详情，不再占主界面", () => {
     expect(ingest).not.toContain("policyVersion");
     expect(ingest).not.toContain("payloadSha256");
     expect(ingest).not.toContain("confirmedAtUtc");
-    expect(folded).toContain("策略版本");
-    expect(folded).toContain("内容指纹");
-    expect(folded).toContain("payloadSha256");
+    // 技术值仍在 `<TechnicalDetails>` 那一层折叠里（弹窗只是它的新宿主），所以判据读 folded。
+    expect(source("ui/SendMethodDialog.tsx")).toContain("<TechnicalDetails");
+    const methodFolded = foldedCopy("ui/SendMethodDialog.tsx");
+    expect(methodFolded).toContain("策略版本");
+    expect(methodFolded).toContain("内容指纹");
+    expect(methodFolded).toContain("payloadSha256");
   });
 });
 
@@ -243,12 +277,25 @@ describe("M5-3A · RecordDetail", () => {
     expect(detail).not.toContain("起于 {run.startedAtUtc}");
   });
 
-  it("这些技术值改在「技术详情」里，可访问而不是消失", () => {
-    expect(folded).toContain("记录编号");
-    expect(folded).toContain("record.timezone_id");
-    expect(folded).toContain("content_sha256");
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-详情页统一反馈面与状态口径.md〕
+  // 旧判据：这四类技术值**常驻**页脚那个「技术详情」折叠件（`可访问而不是消失`）。
+  // C1 裁定（2026-11-03）：撤走常驻，值改由失败提示上的「复制技术信息」按需取回。
+  // 所以判据从「这一页的折叠段里能看到」重述为「这一页不再常驻 + 值仍然可取得」——
+  // 可访问这件事没有削弱：它从每一屏页脚，变成出错那一屏的一个动作。
+  it("技术值不再常驻详情页折叠件，改为随失败提示按需取回（C1 裁定）", () => {
+    expect(folded).not.toContain("记录编号");
+    expect(folded).not.toContain("record.timezone_id");
+    expect(folded).not.toContain("content_sha256");
+    // run 那一组仍在「查看整理详情」里：它是这一版结果的读数，不是排障用的标识符。
     expect(folded).toContain("run.resultState");
     expect(folded).toContain("run.startedAtUtc");
+    // 可取得：详情页调用组装函数，值本身与「复制技术信息」这个下一步都真的存在。
+    expect(detail).toContain("recordTechnicalRows(");
+    const rows = source("notices.ts");
+    expect(rows).toContain("记录编号");
+    expect(rows).toContain("record.timezone_id");
+    expect(rows).toContain("content_sha256");
+    expect(rows).toContain("复制技术信息");
   });
 
   it("开发说明（ADR / PROJ）整页退场", () => {
@@ -270,11 +317,19 @@ describe("M5-3A · RecordDetail", () => {
     expect(detail).toContain("等待你表态");
   });
 
-  it("「改原文不会自动重新整理」只剩方案推荐的行动句", () => {
-    expect(detail).toContain("改原文");
-    expect(detail).toContain("不会");
-    expect(detail).toContain("原文已改，待重新整理");
-    expect(detail).not.toContain("旧结果也不算过期");
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批7-保存预告改成只在确认框里说.md〕
+  // 用户裁定（2026-11-03）：这句预告**去掉**。保存那一步已经有确认框在决策点把后果说全
+  // （R1 那一句逐字：「修改保存后的原文为新版本，整理结果仍为旧记录的整理结果，需要发送给模型
+  // 重新整理后才会以新版本更新整理结果。」）。同一件事说两遍不是更安全，是把决策点稀释成背景音；
+  // 而它原来那份 29 字的重量，恰好是详情页说明类占比从 38% 推到 55% 的那一笔。
+  // 判据没有变松：从「这句必须出现在某一页」换成「它不再出现在任何一页，而它要传达的那件事
+  // 由保存确认框逐字承担」——后半句是原来没有的一钉。
+  it("「改原文不会自动重新整理」这句预告退场，后果只在保存确认框里说", () => {
+    const edit = visibleCopy("RecordEditPanel.tsx");
+    expect(detail, "详情页不再有这句").not.toContain("原文已改，待重新整理");
+    expect(edit, "编辑页也不再有这句").not.toContain("原文已改，待重新整理");
+    expect(edit).toContain("需要发送给模型重新整理后才会以新版本更新整理结果");
+    expect(edit).not.toContain("旧结果也不算过期");
   });
 });
 
@@ -298,10 +353,15 @@ describe("M5-3A · SettingsPanel", () => {
     expect(settings).toContain("一律换成占位符");
   });
 
-  it("三种模式只剩短标签；当前默认单独显示且用用户语言", () => {
-    expect(settings).toContain("完全不送出去。");
-    expect(settings).toContain("内容不出本机，整理慢一些。");
-    expect(settings).toContain("当前默认：");
+  it("四种模式的说明只剩共用那张表；设置值是写入页与睡前页共用的默认值，用用户语言解释", () => {
+    // 〔整理方式改动〕设置页从前另抄一份档位说明（旧的 `modeNote`），于是同一档在两个页面说两句话。
+    // 现在这一页只 import 选择器那张表（`MODE_SHORT_LABEL`），本文件里不许再出现第四份文案。
+    expect(settings).not.toContain("完全不送出去。");
+    expect(settings).not.toContain("内容不出本机，整理慢一些。");
+    expect(source("SettingsPanel.tsx")).toMatch(/import \{ MODE_SHORT_LABEL \} from "\.\/ui\/ProcessingModePicker\.tsx"/);
+    // 〔2026-11-06 用户裁定〕设置页恢复四档，且与写入页/睡前页共用同一个默认值。
+    expect(settings).toContain("写入页与睡前页共用");
+    expect(settings).not.toContain("当前默认：");
     expect(settings).not.toContain("当前生效：{config.defaultMode}");
   });
 
@@ -456,8 +516,12 @@ describe("M5-3B · SearchPanel：只渲染现在真正可用的原文层", () =>
     expect(search).not.toContain("<Prose");
   });
 
-  it("输入前 / 无结果各一句产品语言", () => {
-    expect(search).toContain("输入一个词，搜索你写过的内容。");
+  it("无结果那句产品语言仍在；输入前那句并进 placeholder", () => {
+    // 〔web-redesign 有意变动 · 理由单列在 2026-11-02 工作日志〕输入前那句「输入一个词，搜索你写过
+    // 的内容。」删除：输入框的 placeholder「找什么？人、事、感觉、还是当时写下的那句话」已经把同一件
+    // 事说了一遍，同一屏两句说句话。不削弱：输入前的指引改由 placeholder 承担（钉字面量），
+    // 无结果那句连同可执行建议「换个说法试试」仍逐字钉住。
+    expect(search).toContain('placeholder="找什么？人、事、感觉、还是当时写下的那句话"');
     expect(search).toContain("换个说法试试");
     expect(search).not.toContain("还没接上投影");
   });
@@ -483,7 +547,11 @@ describe("M5-3B · SuggestionsPanel：状态语义压成一句，缺口卡删除
   // PROJECTION_UNREADY 这两个常量」。拼出来的那句讲的是投影，不是建议 —— 属于方案 C 层。
   // 等价语义：空态仍是一句 import 的用户语言（一对新常量），出处由 web-ui7 钉两边共用同一对。
   it("状态语义一句话保留；空态是一句 import 的用户语言，不再拼两个投影常量", () => {
-    expect(sugg).toContain("忽略不会删除；采纳和撤回是终态。");
+    // 〔web-redesign 有意变动 · 理由单列在 2026-11-02 工作日志〕「忽略不会删除；采纳和撤回是终态。」
+    // 删除：这一页一条表态按钮都不渲染（下面那条测试逐字钉住「没有采纳 / 没有撤回」），这句在解释一套
+    // 用户此刻点不到的动作。不削弱：动作语义的出处仍在 sendTrack/labels 那套常量里，接上端点时连同
+    // 这句一起回来；本页主可见区只剩标题与真实计数。
+    expect(sugg).toContain("待确认建议");
     expect(sugg).toContain("emptyText={content === null ? SUGGESTIONS_UNREADY : NO_SUGGESTION_ROWS}");
     expect(sugg).not.toContain("NO_READABLE_DATA");
     expect(sugg).not.toContain("PROJECTION_UNREADY");
@@ -540,11 +608,16 @@ describe("M5-3B · SleepPanel：实现理由退场，安静语义保留", () => 
     expect(sleep).not.toContain("缺省值落库");
   });
 
-  it("模式区改成一句产品语言；收好动作继续无计数、不检查、不挽留", () => {
+  it("模式区改回选择器；收好动作继续无计数、不检查、不挽留", () => {
     const visible = visibleCopy("SleepPanel.tsx");
-    expect(visible).toContain("这里只负责保存；只有选了本机整理或云端发送，才会进入「待整理」。");
+    // 〔2026-11-06 用户裁定〕睡前页恢复四档选择器，与写入页/设置页共用同一个默认值。
     expect(visible).toContain("<ProcessingModePicker");
-    expect(visible).toContain("这里不会数你还有多少条没处理，也不挽留。");
+    expect(visible).toContain("这里只负责保存；只有选了本机整理或云端发送，才会进入「待整理」。");
+    expect(source("SleepPanel.tsx")).toContain("api.createRecord(text, mode)");
+    // 〔web-redesign 有意变动 · 理由单列在 2026-11-02 工作日志〕「这里不会数你还有多少条没处理，
+    // 也不挽留。」整句退出：它描述界面自己的姿态，不是用户的数据。不削弱：同一件事仍由下面三条
+    // 结构判据守着（不引 pending 端点、没有计数字段、不自动发起整理），正面那句「这些事情已经
+    // 收好了。」继续由 web-ui4 钉住。
     expect(visible).toContain("收好并结束");
     expect(visible).not.toContain("ingestPending");
     expect(visible).not.toContain("pendingCount");
@@ -581,19 +654,27 @@ describe("M5-3B · App/MorePage：技术信息进折叠，入口与返回件不�
   });
 });
 
-describe("M5-3B · SettingsPanel：只读的原因从 title 变成可见说明", () => {
+describe("M5-3B · SettingsPanel：说明直接可见而不是 hover-only（M5-6 起整理方式可编辑）", () => {
   const settings = visibleCopy("SettingsPanel.tsx");
 
-  it("默认模式为何只读，直接可见而不是 hover-only", () => {
-    expect(settings).toContain("默认模式由服务端的配置文件决定；这里只显示，不改。");
+  it("「三处共用同一个默认值」这条规则，直接可见而不是藏在交互之后", () => {
+    // 〔2026-11-06 用户裁定〕设置页、写入页、睡前页共用同一个默认整理方式；在入口页改档会回写它。
+    // 「记住上次」开关按裁定退场，不许留下空壳文案。
+    expect(settings).toContain("写入页与睡前页共用");
+    expect(settings).toContain("在写入页/睡前页改档也会回写到这同一个值");
+    expect(settings).not.toContain("记住上次");
+    expect(settings).not.toContain("每次切换整理方式会立即更新");
   });
 
-  it("「写服务端的配置」的语义仍在这页的出处里；radio 仍全部 disabled", () => {
-    expect(source("SettingsPanel.tsx")).toContain("写服务端的配置");
+  it("「写服务端的配置」的语义仍在这页的出处里；radio 可编辑、只按可用性动态禁用", () => {
+    expect(source("SettingsPanel.tsx")).toContain("api.updateProcessingDefaults");
     const radios = [...source("SettingsPanel.tsx").matchAll(/<input\s+type="radio"[\s\S]*?\/>/g)];
     expect(radios.length).toBeGreaterThan(0);
     for (const radio of radios) {
-      expect(radio[0], "默认模式仍然不该能点").toContain("disabled");
+      expect(radio[0], "可编辑就必须接 onChange").toContain("onChange=");
+      if (radio[0].includes("disabled")) {
+        expect(radio[0], "M5-6：只允许按可用性动态禁用，裸 disabled 整排锁死仍是被禁的旧世界").toContain("disabled={");
+      }
     }
   });
 });
@@ -601,17 +682,23 @@ describe("M5-3B · SettingsPanel：只读的原因从 title 变成可见说明",
 describe("M5-3B · IngestPanel：未取预览只剩一条状态说明", () => {
   const gate = visibleCopy("IngestPanel.tsx");
 
-  it("未预览区不再重复两句：保留状态行，删掉「不发请求、不写任何数据」的 paraphrase", () => {
-    expect(gate).toContain("先在本机查看实际发送文本；这一步不会发送。");
+  // 〔web-redesign 有意变动 · 同一条理由〕第三步把「先看」这一步收成一颗主按键：
+  // 未预览时框里只有一句解释，那颗键叫「看要发的内容」（阶段表的动词）。
+  it("未预览区不再重复两句：保留一句解释，删掉「不发请求、不写任何数据」的 paraphrase", () => {
+    // 〔web-redesign 第三步 · 用户裁定〕「先看一眼」阶段已删：进屏即自动取预览，
+    // 这一格只剩一句「正在本机取…」，主按键按不动。判据因此钉「没有可点的中间步骤」。
+    expect(gate).toContain("正在本机取这份要发出去的内容");
     expect(gate).not.toContain("不发请求、不写任何数据");
-    expect(gate).toContain("查看实际待发送文本");
+    expect(stagePrimaryEnabled("loading")).toBe(false);
   });
 
   it("批次 A 钉死的授权语义不受影响：payloadText 仍在主可见区", () => {
     expect(gate).toContain("<pre className=\"record-text\">{preview.payloadText}</pre>");
-    expect(gate).toContain("原样发出去");
+    expect(visibleCopy("ui/SendReviewDialog.tsx")).toContain("脱敏了");
     expect(gate).toContain("脱敏");
-    expect(gate).toContain("匿名化");
+    // 〔web-redesign 第三步〕「脱敏不等于匿名化」随那两组单选搬进「发送方式」弹窗：
+    // 它解释的是遮蔽质量，站在做那个选择的地方比站在框里更有用。
+    expect(visibleCopy("ui/SendMethodDialog.tsx")).toContain("匿名化");
   });
 });
 
@@ -757,5 +844,70 @@ describe("M5-3C · 「人物与事物」的 lede 与页面真实状态数一致"
       expect(shape.lede, shape.view).not.toContain("两个身份状态");
       expect(shape.lede.length, `${shape.view} lede 超预算`).toBeLessThanOrEqual(30);
     }
+  });
+});
+
+/* ── 整理方式四档的文案（2026-11-06 用户裁定，三页同步） ────────────────── */
+
+describe("整理方式 · 四档文案逐字与「一处定义、三页共用」", () => {
+  it("标签逐字：仅保存 / 本地模型 / 云端（本地脱敏）/ 云端（原文发送）", () => {
+    expect(MODE_LABEL).toEqual({
+      manual_only: "仅保存",
+      local_model: "本地模型",
+      cloud_redacted: "云端（本地脱敏）",
+      cloud_raw: "云端（原文发送）",
+    });
+  });
+
+  it("描述逐字：四档都回答「这一档保存之后会发生什么」", () => {
+    const picker = source("ui/ProcessingModePicker.tsx");
+    expect(picker).toContain('manual_only: "只保存在本地，不发送到模型整理"');
+    expect(picker).toContain('local_model: "先保存，需要时在本机整理"');
+    expect(picker).toContain('cloud_redacted: "本地模型处理脱敏，发送云端模型整理"');
+    expect(picker).toContain('cloud_raw: "不进行脱敏，原文发送云端模型整理"');
+  });
+
+  it("旧说法一句都不许留：标签改了却留着旧描述，等于同一档说了两句互相矛盾的话", () => {
+    const picker = source("ui/ProcessingModePicker.tsx");
+    const settings = source("SettingsPanel.tsx");
+    for (const stale of [
+      "只自己看，不送模型",
+      "只保存在本机",
+      "云端（脱敏后发送）",
+      "保存后去确认发送",
+    ]) {
+      expect(picker, `选择器里还留着旧说法：${stale}`).not.toContain(stale);
+      expect(settings, `设置页里还留着旧说法：${stale}`).not.toContain(stale);
+    }
+  });
+
+  it("收起后的抬头写档位名称，说明只出现在展开的每一行上", () => {
+    const picker = source("ui/ProcessingModePicker.tsx");
+    // 收起时用户问的是「我现在选的是哪一档」，所以抬头取名称（MODE_LABEL），不是那一长句说明。
+    expect(picker).toMatch(/整理方式：<strong>\{MODE_LABEL\[props\.value\]/);
+    expect(picker).not.toMatch(/整理方式：<strong>\{MODE_SHORT_LABEL/);
+    // 展开的每一行照旧给说明（名称在 row-title，说明在 row-meta）。
+    expect(picker).toContain("MODE_SHORT_LABEL[choice.key]");
+  });
+
+  it("三页共用同一个单点：写记录 / 查看记录 / 设置都取这两张表，不各抄一份", () => {
+    const picker = source("ui/ProcessingModePicker.tsx");
+    // 描述只有一处定义——多一份就会漂成两个真相。
+    expect([...picker.matchAll(/export const MODE_SHORT_LABEL/g)]).toHaveLength(1);
+    // 写记录（QuickPanel）、查看记录（RecordDetail）、睡前（SleepPanel）用同一个选择器组件。
+    for (const page of ["QuickPanel.tsx", "RecordDetail.tsx", "SleepPanel.tsx"]) {
+      expect(source(page), page).toContain("<ProcessingModePicker");
+    }
+    // 设置页不画选择器，但说明取的是同一张表。
+    expect(source("SettingsPanel.tsx")).toMatch(
+      /import \{ MODE_SHORT_LABEL \} from "\.\/ui\/ProcessingModePicker\.tsx"/,
+    );
+    expect(source("SettingsPanel.tsx")).not.toContain("modeNote");
+  });
+
+  it("引用旧描述的三句孤句一并同步（不改就成了没人认领的旧说法）", () => {
+    expect(source("QuickPanel.tsx")).toContain("这一条先按「仅保存」处理");
+    expect(source("SleepPanel.tsx")).toContain("这一条先按「仅保存」处理");
+    expect(source("SettingsPanel.tsx")).toContain("写入页会按「仅保存」处理");
   });
 });

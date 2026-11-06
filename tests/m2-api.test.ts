@@ -7,6 +7,7 @@ import { boot, shutdown, type BootResult } from "../src/server/runtime/bootstrap
 import { ensureConfigFile } from "../src/server/config/config.ts";
 import { resolveDataLayout } from "../src/server/config/paths.ts";
 import type { DataLayout } from "../src/server/config/paths.ts";
+import { DEFAULT_API_KEY_ENV } from "../src/shared/constants/model.ts";
 import {
   makeSandbox,
   type Sandbox,
@@ -18,6 +19,7 @@ import {
   SYSTEM_PROMPT,
   envelope,
   makeAdapter,
+  setRecordMode,
   stubTransport,
   validOutput,
 } from "./helpers/ingestFixtures.ts";
@@ -78,7 +80,8 @@ async function ensureShared(): Promise<void> {
   writePort(sandbox.layout, port);
   const stub = stubTransport(OK_ENVELOPE(validOutput()));
   booted = await boot({
-    env: { TB_DATA_DIR: sandbox.root },
+    // Keep credential writes inside the test sandbox, never the real user home.
+    env: { TB_DATA_DIR: sandbox.root, USERPROFILE: sandbox.root, HOME: sandbox.root },
     log: () => {},
     ingestProvider: {
       adapter: makeAdapter(),
@@ -120,7 +123,7 @@ async function makeRecord(text: string, mode?: string): Promise<{ recordId: stri
   const created = booted!.workspace.records.createRecord(text);
   const recordId = created.record.id;
   if (mode !== undefined) {
-    booted!.db.prepare("update capture_record set processing_mode = ? where id = ?").run(mode, recordId);
+    setRecordMode(booted!.db, recordId, mode);
     // 记录被改模式不算内容编辑，版本不变。
   }
   return { recordId, revisionId: created.revision.id };
@@ -141,46 +144,43 @@ describe("§十二 九项操作（真实 HTTP，Provider 注入走真链路）",
 
   it("op8 PUT /api/ingest/config：保存两档模型配置，标记重启生效且不泄露密钥", async () => {
     const sentinel = "sk-config-test-sentinel";
-    process.env.TB_UI_TEST_KEY = sentinel;
-    try {
-      const r = await call("PUT", "/api/ingest/config", {
-        localModel: {
-          enabled: true,
-          provider: "ollama",
-          model: "qwen3:8b",
-          baseUrl: "http://127.0.0.1:11434/v1",
-          callPath: "ollama_openai_compatible",
-          supportsStructuredOutput: false,
-          requestTimeoutMs: 60000,
-          apiKeyEnv: "TB_LOCAL_TEST_KEY",
-        },
-        cloudModel: {
-          enabled: true,
-          provider: "openai_compatible",
-          model: "gpt-4.1-mini",
-          baseUrl: "https://example.invalid/v1",
-          callPath: "http_json_lenient",
-          supportsStructuredOutput: true,
-          requestTimeoutMs: 45000,
-          apiKeyEnv: "TB_UI_TEST_KEY",
-        },
-      });
-      expect(r.status).toBe(200);
-      expect(r.json.restartRequired).toBe(true);
-      expect(r.json.localModel.model).toBe("qwen3:8b");
-      expect(r.json.cloudModel.model).toBe("gpt-4.1-mini");
-      expect(r.json.cloudModel.apiKeyConfigured).toBe(true);
-      expect(r.text).not.toContain(sentinel);
+    const r = await call("PUT", "/api/ingest/config", {
+      localModel: {
+        enabled: true,
+        provider: "ollama",
+        model: "qwen3:8b",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        callPath: "ollama_openai_compatible",
+        supportsStructuredOutput: false,
+        requestTimeoutMs: 60000,
+        apiKeyEnv: "TB_LOCAL_TEST_KEY",
+      },
+      cloudModel: {
+        enabled: true,
+        provider: "openai_compatible",
+        model: "gpt-4.1-mini",
+        baseUrl: "https://example.invalid/v1",
+        callPath: "http_json_lenient",
+        supportsStructuredOutput: true,
+        requestTimeoutMs: 45000,
+        apiKeyEnv: "TB_UI_TEST_KEY",
+        // M5-6：直接输入密钥保存；旧测试的 process.env 注入不再是唯一入口。
+        apiKey: sentinel,
+      },
+    });
+    expect(r.status).toBe(200);
+    expect(r.json.restartRequired).toBe(true);
+    expect(r.json.localModel.model).toBe("qwen3:8b");
+    expect(r.json.cloudModel.model).toBe("gpt-4.1-mini");
+    expect(r.json.cloudModel.apiKeyConfigured).toBe(true);
+    expect(r.text).not.toContain(sentinel);
 
-      const saved = JSON.parse(readFileSync(booted!.layout.configFile, "utf8")) as {
-        model: { local_model: { model: string }; cloud_model: { api_key_env: string } };
-      };
-      expect(saved.model.local_model.model).toBe("qwen3:8b");
-      expect(saved.model.cloud_model.api_key_env).toBe("TB_UI_TEST_KEY");
-      expect(JSON.stringify(saved)).not.toContain(sentinel);
-    } finally {
-      delete process.env.TB_UI_TEST_KEY;
-    }
+    const saved = JSON.parse(readFileSync(booted!.layout.configFile, "utf8")) as {
+      model: { local_model: { model: string }; cloud_model: { api_key_env: string } };
+    };
+    expect(saved.model.local_model.model).toBe("qwen3:8b");
+    expect(saved.model.cloud_model.api_key_env).toBe(DEFAULT_API_KEY_ENV);
+    expect(JSON.stringify(saved)).not.toContain(sentinel);
   });
 
   it("op1 GET /api/ingest/pending：列出待处理记录带状态与摘要", async () => {
@@ -254,9 +254,32 @@ describe("§十二 九项操作（真实 HTTP，Provider 注入走真链路）",
     // 待发送文本已脱敏：原文里的手机号/邮箱不出现。
     expect(r.json.payloadText).not.toContain("13800138000");
     expect(r.json.payloadText).not.toContain("zhang@example.com");
-    // 映射（本地凭据）绝不出现在响应：无 map/spans/nonce/originalStart 任何键。
-    for (const forbidden of ['"map"', '"spans"', '"nonce"', '"originalStart"', '"redactionMap"']) {
+    // 映射（本地凭据）绝不出现在响应：无 map/nonce/redactionMap 任何一个键。
+    for (const forbidden of ['"map"', '"nonce"', '"redactionMap"']) {
       expect(r.text).not.toContain(forbidden);
+    }
+    // 旧断言里这一列还多两枚键名 `'"spans"'` 与 `'"originalStart"'`，本批把它们**换成直接断言**，理由逐条：
+    //  - `"spans"`：M9-4c 起 `SendPreviewDto` 明确带这一字段，让界面说得出「哪一处是谁遮的」。
+    //    键名从来只是代理指标，实质是「映射本体 + 原文词面不外泄」，所以换成下面两条直接的。
+    //  - `"originalStart"`：它是 `spans` 每一项的两个坐标键，随上一条一起成为对外面的一部分；
+    //    隐私判据落在「坐标是数字、不携词面」上，不是「这个键名不许出现」上。
+    // 与 m6-1a 的措辞保持一致：那里 raw 轨的判据是 `spans` 逐字为空，这一条是脱敏轨，判据是形状。
+    const spans = r.json.spans as Record<string, unknown>[];
+    expect(spans.length).toBeGreaterThan(0);
+    for (const span of spans) {
+      expect(Object.keys(span).sort()).toEqual(
+        ["entityId", "kind", "originalEnd", "originalStart", "placeholder", "source"].sort(),
+      );
+      expect(Number.isInteger(span.originalStart)).toBe(true);
+      expect(Number.isInteger(span.originalEnd)).toBe(true);
+    }
+    // 每一项都不携原文片段：把两个坐标回插到夹具文本上，截出来的必须正是被遮的词面，
+    // 而响应里任何一处都不出现它。
+    const source = "联系我 13800138000 或 zhang@example.com 详谈";
+    for (const span of spans) {
+      const surface = source.slice(span.originalStart as number, span.originalEnd as number);
+      expect(surface.length).toBeGreaterThan(0);
+      expect(r.text).not.toContain(surface);
     }
   });
 
@@ -275,9 +298,10 @@ describe("§十二 九项操作（真实 HTTP，Provider 注入走真链路）",
     const parse = await call("POST", "/api/ingest/parse", { recordId });
     expect(parse.json.succeeded).toBe(true);
 
-    // 新解析落的是 candidate 结果态；op9 读的是 §3.7 current 视图，须经采纳才可见。
-    // 采纳走服务面 adoptCurrent（路由层不裸改状态），再验证投影。
-    booted!.workspace.makeIngestService()!.adoptCurrent({ candidateRunId: parse.json.runId as string });
+    // Phase B：首次整理自动生效；只有仍是候选时才需要手动采纳。
+    if (parse.json.autoAdopted !== true) {
+      booted!.workspace.makeIngestService()!.adoptCurrent({ candidateRunId: parse.json.runId as string });
+    }
 
     const before = await call("GET", `/api/ingest/effective/${revisionId}`);
     expect(before.status).toBe(200);
@@ -375,9 +399,7 @@ describe("四类错误语义可自动化区分", () => {
     });
     try {
       const created = failing.workspace.records.createRecord(LOCAL_RAW);
-      failing.db
-        .prepare("update capture_record set processing_mode = 'local_model' where id = ?")
-        .run(created.record.id);
+      setRecordMode(failing.db, created.record.id, "local_model");
       const res = await fetch(`http://127.0.0.1:${port}/api/ingest/parse`, {
         method: "POST",
         headers: { "content-type": "application/json" },

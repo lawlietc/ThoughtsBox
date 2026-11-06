@@ -22,6 +22,7 @@
  */
 
 import { loadEnums } from "../../shared/contracts/load.ts";
+import type { AnalysisProvider, RedactionMode, SendContentMode } from "../../shared/contracts/enums.ts";
 import type { JsonObject } from "../privacy/manifest.ts";
 import type { RedactionMap } from "../privacy/redaction.ts";
 import {
@@ -55,6 +56,13 @@ export function isTracePhase(value: unknown): value is TracePhase {
  * Trace 的字段面封闭集：§11.1 逐项列出的定位能力落完就收口。
  * 序列化时逐键核对，多一个键即拒——「不得扩展为第二份数据库」由此成为可执行断言，
  * 而不是一句注释。
+ *
+ * M6-0C 扩容三键（草案 §八-1 已定）：排障时必须能回答「这一次是按哪三轴发的」——
+ * 两个云端派生档位共用同一个适配器、只差在内容形态的时候，只看 processing_mode 分不清。
+ * 字段面扩容属于契约面变更，与 0008 迁移同批走。
+ *
+ * 这里**不写**任何模式名或轴值字面量：`tests/m2-trace.test.ts` 用「本文件不出现这些字面量」
+ * 来钉住「trace.ts 没有第二份清单」。要举反例，说形态别说值。
  */
 export const TRACE_ENTRY_FIELDS = [
   "recordId",
@@ -62,6 +70,9 @@ export const TRACE_ENTRY_FIELDS = [
   "parseRunId",
   "idempotencyKey",
   "pipelineFingerprint",
+  "analysisProvider",
+  "redactionMode",
+  "sendContentMode",
   "processingMode",
   "provider",
   "model",
@@ -106,7 +117,14 @@ export interface TraceEntry {
   readonly parseRunId?: string;
   readonly idempotencyKey?: string;
   readonly pipelineFingerprint?: string;
-  /** 封闭三值；全字段面里唯一没有编译期保护的枚举字段，取值门在 `CLOSED_VALUE_GATES` 兜住。 */
+  /**
+   * 记录级三轴（M6-0C / 草案 §八-1）：判定源的审计面。取值门见 `CLOSED_VALUE_GATES`，
+   * 三键都是封闭枚举成员，所以进 Trace 不新增任何原文面。
+   */
+  readonly analysisProvider?: AnalysisProvider;
+  readonly redactionMode?: RedactionMode;
+  readonly sendContentMode?: SendContentMode;
+  /** 派生只读兼容字段；封闭四值，全字段面里唯一没有编译期保护的枚举字段，取值门在 `CLOSED_VALUE_GATES` 兜住。 */
   readonly processingMode?: ProcessingMode;
   readonly provider?: string;
   readonly model?: string;
@@ -182,7 +200,8 @@ function guardLiterals(guards: PrivacyGuards): string[] {
  * （E-07，与 T-16「迁移字面量 == enums.json」同一手法）。清单漂移时门的判定跟着漂移，
  * 而不是两处各说各话。
  */
-const PROCESSING_MODES: readonly string[] = loadEnums().processing_modes;
+const CONTRACT_ENUMS = loadEnums();
+const PROCESSING_MODES: readonly string[] = CONTRACT_ENUMS.processing_modes;
 
 function membershipOf(values: readonly string[]): (value: unknown) => boolean {
   return (value: unknown): boolean => typeof value === "string" && values.includes(value);
@@ -199,8 +218,11 @@ interface ValueGate {
  *
  * 原来这里只核对键名，运行时把 `phases[0].phase` 塞成 `"not_a_phase"` 照样序列化通过，
  * `isTracePhase()` 除了测试没有第二个调用点——与 M2-2b 裁定的 (d1)「白名单里的枚举字段
- * 补取值门」是同一类漏洞。四份清单一律引用各自的事实源：阶段取本文件的 `TRACE_PHASES`
- * （经由 `isTracePhase`），路径与错误类别取 `provider.ts`，处理模式取 `enums.json`。
+ * 补取值门」是同一类漏洞。清单一律引用各自的事实源：阶段取本文件的 `TRACE_PHASES`
+ * （经由 `isTracePhase`），路径与错误类别取 `provider.ts`，处理模式与三轴取 `enums.json`。
+ *
+ * 三轴门比 `processingMode` 更早生效是有意为之：`processing_mode` 是派生值，光看它
+ * 分不清「发的是原文还是脱敏文本」，而排障要问的正是这个。
  */
 const CLOSED_VALUE_GATES: Readonly<Record<string, ValueGate>> = {
   phase: { label: "TRACE_PHASES", accepts: isTracePhase },
@@ -208,6 +230,23 @@ const CLOSED_VALUE_GATES: Readonly<Record<string, ValueGate>> = {
   attemptedPaths: { label: "PROVIDER_CALL_PATHS", accepts: membershipOf(PROVIDER_CALL_PATHS) },
   errorKind: { label: "PARSE_ERROR_KINDS", accepts: membershipOf(PARSE_ERROR_KINDS) },
   processingMode: { label: "enums.json 的 processing_modes", accepts: membershipOf(PROCESSING_MODES) },
+  analysisProvider: {
+    label: "enums.json 的 analysis_providers",
+    // `local` 是占位档位：取值域保留（草案 §八之三），门照收以保证历史/人工写入可读，
+    // 但当前实例没有内置的本地运行时，它只能指向用户自备的回环服务。
+    accepts: membershipOf(CONTRACT_ENUMS.analysis_providers),
+  },
+  redactionMode: {
+    label: "enums.json 的 redaction_modes",
+    // `local_llm` 自 M9-4 起已实现：这里**接受**它，为的是读得懂库里/历史里的既有行，
+    // 与上面 `analysisProvider=local` 那道门同一取向。能不能跑由装配层按配置判
+    // （`provider.assertRedactionPlanRunnable`），不在守门处放宽。
+    accepts: membershipOf(CONTRACT_ENUMS.redaction_modes),
+  },
+  sendContentMode: {
+    label: "enums.json 的 send_content_modes",
+    accepts: membershipOf(CONTRACT_ENUMS.send_content_modes),
+  },
 };
 
 /**

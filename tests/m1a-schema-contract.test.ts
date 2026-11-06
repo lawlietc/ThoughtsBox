@@ -13,6 +13,12 @@ import type { Database } from "../src/server/db/adapter.ts";
  */
 
 const MIGRATION_FILE = "src/server/db/migrations/0002_records_and_search.sql";
+/**
+ * M6-0C：`capture_record` 在 0008 被整表重建，`processing_mode` 的 CHECK 与 DEFAULT
+ * **现居 0008**（0002 已冻结，逐字不改，它里面仍是三值）。T-16 的「单一事实源」断言因此
+ * 必须跟着搬家：判 processing_mode 用现行定义（0008），判另两列仍用 0002。
+ */
+const THREE_AXIS_MIGRATION_FILE = "src/server/db/migrations/0008_three_axis_contract.sql";
 const ENUMS_FILE = "src/shared/constants/enums.json";
 
 let sandbox: Sandbox;
@@ -42,15 +48,29 @@ const sqlCode = sql
   .join("\n");
 const enums = JSON.parse(readFileSync(ENUMS_FILE, "utf8")) as Record<string, unknown>;
 
+const threeAxisSqlCode = readFileSync(THREE_AXIS_MIGRATION_FILE, "utf8")
+  .split("\n")
+  .filter((line) => !line.trim().startsWith("--"))
+  .join("\n");
+/**
+ * 只取 0008 里 `CREATE TABLE capture_record (...)` 那一段：同一份文件里还有一句
+ * `processing_mode IN ('manual_only','local_model','cloud_redacted')`（迁移报告的脏值计数 CASE），
+ * 它**故意**只列旧三值。整文件正则会被它先命中，对账因此必须锁定建表块。
+ */
+const threeAxisRecordBlock = /CREATE TABLE capture_record \([\s\S]*?\n\) STRICT;/.exec(threeAxisSqlCode)?.[0];
+if (threeAxisRecordBlock === undefined) {
+  throw new Error("0008 里未找到 capture_record 的建表块（静态对账前提失效）");
+}
+
 /** 抽取 `column IN ( 'a', 'b', … )` 的字面量序列（与迁移书写顺序无关的比较交给集合断言）。 */
-function inList(column: string): string[] {
-  const match = new RegExp(`${column} IN \\(([\\s\\S]*?)\\)`).exec(sql);
+function inList(column: string, source: string = sql): string[] {
+  const match = new RegExp(`${column} IN \\(([\\s\\S]*?)\\)`).exec(source);
   if (match === null) throw new Error(`迁移 SQL 中未找到 ${column} IN (...) CHECK`);
   return [...match[1]!.matchAll(/'([^']*)'/g)].map((m) => m[1]!);
 }
 
-function defaultOf(column: string): string {
-  const match = new RegExp(`${column} TEXT NOT NULL DEFAULT '([^']+)'`).exec(sql);
+function defaultOf(column: string, source: string = sql): string {
+  const match = new RegExp(`${column} TEXT NOT NULL DEFAULT '([^']+)'`).exec(source);
   if (match === null) throw new Error(`迁移 SQL 中未找到 ${column} 的 DEFAULT`);
   return match[1]!;
 }
@@ -110,17 +130,30 @@ describe("T-16：迁移 SQL 枚举字面量与 enums.json 逐项 diff 为空", (
   it("processing_status / processing_mode / privacy_level 三组 IN 集合与枚举源完全一致", () => {
     expect(new Set(inList("processing_status"))).toEqual(new Set(enums.processing_statuses as string[]));
     expect(inList("processing_status")).toEqual(enums.processing_statuses as string[]);
-    expect(inList("processing_mode")).toEqual(enums.processing_modes as string[]);
+    // processing_mode 的现行定义在 0008（整表重建），字面量顺序与 enums.json 逐项同序。
+    expect(inList("processing_mode", threeAxisRecordBlock)).toEqual(enums.processing_modes as string[]);
     expect(inList("privacy_level")).toEqual(enums.privacy_levels as string[]);
+  });
+
+  it("三轴的迁移 CHECK 与 enums.json 逐项一致（草案 §八-2 单一事实源）", () => {
+    expect(inList("analysis_provider", threeAxisRecordBlock)).toEqual(enums.analysis_providers as string[]);
+    expect(inList("redaction_mode", threeAxisRecordBlock)).toEqual(enums.redaction_modes as string[]);
+    expect(inList("send_content_mode", threeAxisRecordBlock)).toEqual(enums.send_content_modes as string[]);
   });
 
   it("三列 DEFAULT 值都是合法枚举成员，且与规格缺省一致", () => {
     expect(defaultOf("processing_status")).toBe("captured");
-    expect(defaultOf("processing_mode")).toBe("manual_only");
+    expect(defaultOf("processing_mode", threeAxisRecordBlock)).toBe("manual_only");
     expect(defaultOf("privacy_level")).toBe("normal");
     expect(enums.processing_statuses).toContain(defaultOf("processing_status"));
-    expect(enums.processing_modes).toContain(defaultOf("processing_mode"));
+    expect(enums.processing_modes).toContain(defaultOf("processing_mode", threeAxisRecordBlock));
     expect(enums.privacy_levels).toContain(defaultOf("privacy_level"));
+  });
+
+  it("三轴的 DEFAULT 都落在「不外发」那一侧：漏写新列不得把原文送出去", () => {
+    expect(defaultOf("analysis_provider", threeAxisRecordBlock)).toBe("none");
+    expect(defaultOf("redaction_mode", threeAxisRecordBlock)).toBe("manual");
+    expect(defaultOf("send_content_mode", threeAxisRecordBlock)).toBe("none");
   });
 
   it("deletion_audit.object_type 封闭集为 17 个业务对象表名，不含修正层/虚表/审计自身", () => {

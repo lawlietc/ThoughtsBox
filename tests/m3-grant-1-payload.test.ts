@@ -15,7 +15,7 @@ import {
   openSandboxDb,
   type Sandbox,
 } from "./helpers/sandbox.ts";
-import { createRecord } from "./helpers/ingestFixtures.ts";
+import { createRecord, setRecordMode } from "./helpers/ingestFixtures.ts";
 import {
   FIXTURE_NOW,
   SYSTEM_PROMPT,
@@ -46,6 +46,8 @@ let booted: BootResult | undefined;
 let base = "";
 /** 桩 transport 每次发送时取当前剧本回稿（占位符 nonce 只有预览后才知道）。 */
 let currentOutput: () => StructuredOutput = () => validOutput();
+/** 下一次发送返回 HTTP 500：用来验证「整理失败不回滚已签发的授权」。 */
+let failNextSend = false;
 /** 已发出的 transport 请求（放行面计数与发送体核对用）。 */
 const sentRequests: { body: Record<string, unknown> }[] = [];
 
@@ -95,6 +97,10 @@ async function ensureBooted(): Promise<BootResult> {
       request: { url: string; body: Record<string, unknown>; headers: Record<string, string>; signal: AbortSignal; callPath: string },
     ) => {
       sentRequests.push(request);
+      if (failNextSend) {
+        failNextSend = false;
+        return { status: 500, body: "stub: provider down" };
+      }
       return { status: 200, body: envelopeOf(currentOutput()) };
     },
   };
@@ -114,6 +120,7 @@ async function ensureBooted(): Promise<BootResult> {
 
 afterEach(async () => {
   currentOutput = () => validOutput();
+  failNextSend = false;
   if (booted !== undefined) {
     await shutdown(booted);
     booted = undefined;
@@ -151,9 +158,7 @@ async function call(method: string, path: string, body?: unknown): Promise<ApiRe
 async function makeCloudRecord(text = RAW_A): Promise<{ recordId: string; revisionId: string }> {
   const b = await ensureBooted();
   const created = b.workspace.records.createRecord(text);
-  b.db
-    .prepare("update capture_record set processing_mode = 'cloud_redacted' where id = ?")
-    .run(created.record.id);
+  setRecordMode(b.db, created.record.id, "cloud_redacted");
   return { recordId: created.record.id, revisionId: created.revision.id };
 }
 
@@ -210,14 +215,14 @@ describe("预览产物按 revision 缓存（R-2 修复面）", () => {
       value: string;
     }[];
     const keys = rows.map((r) => r.key);
-    expect(keys.some((k) => k.startsWith("preview_nonce:"))).toBe(true);
-    expect(keys.some((k) => k.startsWith("preview_payload:"))).toBe(true);
+    expect(keys.some((k) => k.startsWith("preview_v2_nonce:"))).toBe(true);
+    expect(keys.some((k) => k.startsWith("preview_v2_payload:"))).toBe(true);
     const serialized = JSON.stringify(rows);
     for (const forbidden of ["spans", "originalStart", "redactedStart", "placeholder", '"map"', "13800138000", "zhang@example.com"]) {
       expect(serialized).not.toContain(forbidden);
     }
     // nonce 值 = 载荷占位符里的 nonce（证明缓存的就是那份产物）
-    const nonceRow = rows.find((r) => r.key.startsWith("preview_nonce:"))!;
+    const nonceRow = rows.find((r) => r.key.startsWith("preview_v2_nonce:"))!;
     expect(preview.json.payloadText).toContain(`_${nonceRow.value}]`);
   });
 
@@ -287,6 +292,34 @@ describe("op6→op7→op2 完整三段（放行面，沙箱 + Provider 桩，全
     expect(row.policy_version).toBe(confirm.json.policyVersion);
   });
 
+  it("S4：确认后整理失败 ≠ 授权回滚；同一授权原样重试即可成功", async () => {
+    const { recordId, revisionId } = await makeCloudRecord();
+    const p = await call("POST", "/api/ingest/preview", { recordId });
+    const ph = placeholdersOf(p.json.payloadText as string);
+    const phone = ph.find((x) => x.kind === "phone")!;
+    const email = ph.find((x) => x.kind === "email")!;
+
+    const confirm = await call("POST", "/api/ingest/confirm-send", { recordId });
+    expect(confirm.status).toBe(201);
+
+    failNextSend = true;
+    const failed = await call("POST", "/api/ingest/parse", { recordId });
+    expect(failed.status).toBe(200);
+    expect(failed.json.succeeded).toBe(false);
+
+    // 失败没有撤掉授权：确认过的仍是同一份载荷。
+    const afterFail = await call("POST", "/api/ingest/preview", { recordId });
+    expect(afterFail.json.hasApplicableGrant).toBe(true);
+    expect(afterFail.json.payloadSha256).toBe(p.json.payloadSha256);
+
+    // 用户直接重试整理，不需要再确认一次。
+    currentOutput = () => cloudOutput(phone.raw, email.raw);
+    const retry = await call("POST", "/api/ingest/parse", { recordId });
+    expect(retry.json.succeeded).toBe(true);
+    expect(retry.json.replayed).toBe(false);
+    expect(grantRowOf(revisionId, p.json.payloadSha256)).toBeTruthy();
+  });
+
   it("用户手工替换载荷：替换那份成为 op7 签发与 op2 复用的同一份，三段哈希一致", async () => {
     const { recordId, revisionId } = await makeCloudRecord();
     const p0 = await call("POST", "/api/ingest/preview", { recordId });
@@ -350,10 +383,10 @@ describe("跨 revision 不串发（缓存失效语义）", () => {
     await ensureBooted();
     const grants = new GrantService(booted!.db);
     // A 的 grant 对 B 不可用（三绑定第一腿 revision 就断），反之亦然
-    expect(grants.findApplicableGrant(b.revisionId, pa.json.payloadSha256, ca.json.policyVersion)).toBeNull();
-    expect(grants.findApplicableGrant(a.revisionId, pb.json.payloadSha256, cb.json.policyVersion)).toBeNull();
-    expect(grants.findApplicableGrant(a.revisionId, pa.json.payloadSha256, ca.json.policyVersion)).toBeTruthy();
-    expect(grants.findApplicableGrant(b.revisionId, pb.json.payloadSha256, cb.json.policyVersion)).toBeTruthy();
+    expect(grants.findApplicableGrant(b.revisionId, pa.json.payloadSha256, ca.json.policyVersion, "redacted")).toBeNull();
+    expect(grants.findApplicableGrant(a.revisionId, pb.json.payloadSha256, cb.json.policyVersion, "redacted")).toBeNull();
+    expect(grants.findApplicableGrant(a.revisionId, pa.json.payloadSha256, ca.json.policyVersion, "redacted")).toBeTruthy();
+    expect(grants.findApplicableGrant(b.revisionId, pb.json.payloadSha256, cb.json.policyVersion, "redacted")).toBeTruthy();
 
     // B 直接 op2：用的仍是 B 自己缓存的载荷，不会被 A 的缓存外溢污染
     const phB = placeholdersOf(pb.json.payloadText as string);
@@ -389,7 +422,7 @@ describe("跨 revision 不串发（缓存失效语义）", () => {
     // 旧载荷仍只在旧 revision 的缓存键上
     const oldPayload = b.db
       .prepare("select value from app_meta where key = ?")
-      .get(`preview_payload:${revisionId}`) as { value: string } | undefined;
+      .get(`preview_v2_payload:${revisionId}`) as { value: string } | undefined;
     expect(oldPayload?.value).toBe(replaced);
   });
 });
@@ -438,14 +471,14 @@ describe("K-17 复用与三绑定：修复后语义逐条不变", () => {
     // 手写一条只差 policy_version 的行：证明查询是三腿全等，不是两腿
     svcDb
       .prepare(
-        `insert into cloud_send_grant (id, record_revision_id, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
-         values ('csg_policy_v9_probe', ?, ?, ?, 'rules-v9', '2026-10-17T01:00:00.000Z')`,
+        `insert into cloud_send_grant (id, record_revision_id, send_content_mode, redacted_sha256, payload_sha256, policy_version, confirmed_at_utc)
+         values ('csg_policy_v9_probe', ?, 'redacted', ?, ?, 'rules-v9', '2026-10-17T01:00:00.000Z')`,
       )
       .run(revisionId, grant.redacted_sha256, grant.payload_sha256);
-    expect(g.findApplicableGrant(revisionId, preview.payloadSha256, "rules-v9")?.id).toBe("csg_policy_v9_probe");
-    expect(g.findApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion)?.id).toBe(grant.id);
+    expect(g.findApplicableGrant(revisionId, preview.payloadSha256, "rules-v9", "redacted")?.id).toBe("csg_policy_v9_probe");
+    expect(g.findApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion, "redacted")?.id).toBe(grant.id);
     // 两腿匹配的那条不构成对当前 policy 的授权
-    expect(g.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion).id).toBe(grant.id);
+    expect(g.requireApplicableGrant(revisionId, preview.payloadSha256, preview.policyVersion, "redacted").id).toBe(grant.id);
     svcDb.prepare("delete from cloud_send_grant where id = 'csg_policy_v9_probe'").run();
   });
 
@@ -453,9 +486,9 @@ describe("K-17 复用与三绑定：修复后语义逐条不变", () => {
     const { grants: g, db: svcDb, revisionId } = setup();
     const preview = g.preparePreview(revisionId);
     expect(() =>
-      g.requireApplicableGrant(revisionId, sha256OfText(`${preview.payloadText}没确认过的载荷`), preview.policyVersion),
+      g.requireApplicableGrant(revisionId, sha256OfText(`${preview.payloadText}没确认过的载荷`), preview.policyVersion, "redacted"),
     ).toThrow(/没有适用授权/);
-    expect(() => g.requireApplicableGrant(revisionId, "f".repeat(64), preview.policyVersion)).toThrow(
+    expect(() => g.requireApplicableGrant(revisionId, "f".repeat(64), preview.policyVersion, "redacted")).toThrow(
       /没有适用授权/,
     );
   });

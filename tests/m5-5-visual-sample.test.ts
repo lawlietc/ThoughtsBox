@@ -3,7 +3,6 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { quickSecondActionFor } from "../src/web/quickSave.ts";
 import { TABS } from "../src/web/ui/nav.ts";
 
 /**
@@ -102,31 +101,23 @@ describe("M5-5AB · 今天页先给行动，不先讲产品", () => {
   });
 });
 
-describe("M5-5AB · 快速记录收成一行整理方式", () => {
+describe("M5-5AB · 快速记录的四档选择器与两颗动作", () => {
   const quick = stripComments(source("QuickPanel.tsx"));
-  const picker = stripComments(source("ui/ProcessingModePicker.tsx"));
 
-  it("三种模式收进原生 disclosure，不再直接铺三张说明卡", () => {
+  it("写入页恢复整理方式选择器，第二动作按档位渲染", () => {
     expect(quick).toContain("<ProcessingModePicker");
-    expect(picker).toContain("<details className=\"quick-mode\">");
-    expect(picker).toContain("整理方式：");
-    expect(picker).toContain("processingModeChoices()");
+    expect(quick).toContain("quickSecondActionFor(mode)");
+    expect(quick).toMatch(/second !== null && \(/);
     expect(quick).not.toContain("MODE_ACTION_NOTE");
   });
 
-  it("local_model 的「保存并整理」仍是唯一真实第二动作，manual 只有只保存", () => {
-    expect(quickSecondActionFor("manual_only")).toBeNull();
-    expect(quickSecondActionFor("local_model")?.label).toBe("保存并整理");
-    expect(quickSecondActionFor("cloud_redacted")?.label).toBe("保存，去确认发送");
-    expect(quick).toContain("quickSecondActionFor(mode)");
-    expect(quick).toContain("second !== null && (");
-  });
-
-  it("保存成功才清空、先保存再整理、云端不越权", () => {
-    expect(quick).toMatch(/onCreated:\s*\(\)\s*=>\s*setText\(""\)/);
+  it("保存成功才清空、先保存后排队列、这一页不越权碰任何模型调用", () => {
+    // 形状随 M6-1C-R 调整（那条回调先记 recordId 再清空）：锁的还是「清空发生在 onCreated 体内」。
+    expect(quick).toMatch(/onCreated:\s*\(recordId\)\s*=>\s*\{[^}]*setText\(""\)[^}]*\}/);
     expect(quick).toContain("api.createRecord(");
-    expect(quick).toContain("api.ingestParse");
-    expect(quick).not.toMatch(/\bapi\.ingest(Reparse|Preview|ConfirmSend)\b/);
+    // 〔整理方式改动〕第二动作 = 入队；这一页对模型的调用点归零（比从前的「不碰 reparse/preview」更严）。
+    expect(quick).toContain("api.enqueueJob");
+    expect(quick).not.toMatch(/\bapi\.ingest(Parse|Reparse|Preview|ConfirmSend)\b/);
   });
 });
 
@@ -137,7 +128,15 @@ describe("M5-5AB · 记录详情原文优先、技术信息分层", () => {
     expect(detail.indexOf("<SourceSection")).toBeLessThan(detail.indexOf("<ResultSection"));
     expect(detail).toContain('className="detail-primary"');
     expect(detail).toContain('className="detail-result"');
-    expect(detail).toContain('className="detail-editor"');
+    // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批4-编辑独立页与保存确认.md〕
+    // 旧判据是「详情页里有 `className="detail-editor"`」。批 4 按方案 C 把编辑搬成独立子页面
+    // （内嵌 textarea 的四个病里有三个修不掉：同一句话在一屏里出现两份/三份、键盘弹起把上下文推出视野、
+    // 窄屏返回直接把草稿卸掉）。判据因此改成两头一起钉：**详情页不再有那一层**（阅读态与书写态分开），
+    // **编辑页有那张同款纸**（能力没删，只是换了地方）。这比原来多钉了一件事，不是放宽。
+    expect(detail).not.toContain('className="detail-editor"');
+    const edit = stripComments(source("RecordEditPanel.tsx"));
+    expect(edit).toContain('className="quick-sheet"');
+    expect(edit).toContain("<textarea");
   });
 
   it("窄屏详情是独立阅读页，时间不再直接暴露 ISO 串", () => {
@@ -148,8 +147,13 @@ describe("M5-5AB · 记录详情原文优先、技术信息分层", () => {
     expect(detail).not.toContain("{record.created_at_local} ·");
   });
 
+  // 〔web-redesign 有意变动 · 理由单列在 worklogs/2026-11-03-web-redesign-第二步-批9-详情页四处调整.md〕
+  // 用户裁定：详情页的整理方式换成「今天」页那个选择器（`ProcessingModePicker`），
+  // 「整理方式：…」这行 summary 因此不再由详情页手写，而是由那个组件的 `summary` 画
+  // （前缀仍逐字在 `ui/ProcessingModePicker.tsx` 里，`m5-2`/`m5-3`/`m5-5` 都还在钉它）。
+  // 判据换了一头钉：详情页**装了那个组件**；其余三件原样在，能力一件没少。
   it("整理方式、版本历史、整理详情与技术值默认折叠，能力没有删除", () => {
-    expect(detail).toContain("summary={`整理方式：");
+    expect(detail).toContain("<ProcessingModePicker");
     expect(detail).toContain("summary={`版本历史（");
     expect(detail).toContain('summary="查看整理详情"');
     expect(detail).toContain("<TechnicalDetails");
